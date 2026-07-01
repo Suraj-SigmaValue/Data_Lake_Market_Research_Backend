@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+openai
+boto3
+duckduckgo-search
+pytest
