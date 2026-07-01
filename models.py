@@ -17,10 +17,21 @@ class LocationIdentification(BaseModel):
     state: Any = ""
     country: Any = ""
 
+class Transaction(BaseModel):
+    total_price: Any = ""
+    area: Any = ""
+    area_unit: Any = ""
+    area_basis: Any = ""
+    calculated_rate: Any = ""
+    normalized_net_carpet_rate: Any = ""
+    url: Any = ""
+    portal: Any = ""
+
 class PropertyListing(BaseModel):
     project_name: Any = ""
     property_type: Any = ""
     listing_type: Any = ""
+    average_project_rate: Any = ""
     total_price: Any = ""
     area: Any = ""
     area_unit: Any = ""
@@ -30,6 +41,7 @@ class PropertyListing(BaseModel):
     portal: Any = ""
     url: Any = ""
     distance_from_coordinate: Any = ""
+    transactions: List[Transaction] = []
 
 class PropertyCategories(BaseModel):
     residential: List[PropertyListing] = []
