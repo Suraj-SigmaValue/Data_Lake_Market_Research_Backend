@@ -2,11 +2,22 @@ import json
 import os
 import logging
 import requests
+from datetime import datetime
 from bs4 import BeautifulSoup
 from openai import OpenAI
 from ddgs import DDGS
-from models import PipelineResult, LocationIdentification, PropertyCategories, PropertyListing
+from typing import Tuple
+from models import PipelineResult, LocationIdentification, PropertyCategories, PropertyListing, TokenUsage
 from prompt import STAGE1_PROMPT, STAGE2_PROMPT, STAGE3_PROMPT, STAGE4_PROMPT
+
+def extract_token_usage(response) -> TokenUsage:
+    if hasattr(response, 'usage') and response.usage:
+        return TokenUsage(
+            input_tokens=response.usage.prompt_tokens or 0,
+            output_tokens=response.usage.completion_tokens or 0,
+            total_tokens=response.usage.total_tokens or 0
+        )
+    return TokenUsage()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -103,7 +114,7 @@ def build_pipeline_result(location: str, parsed_data: dict) -> PipelineResult:
     
     return PipelineResult(location=location, location_identification=loc_id, property_categories=cats)
 
-def run_openai_analysis(latitude: str, longitude: str, location: str) -> PipelineResult:
+def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
     logger.info("Starting OpenAI analysis pipeline")
     context = get_search_context(location)
     
@@ -127,10 +138,10 @@ def run_openai_analysis(latitude: str, longitude: str, location: str) -> Pipelin
         result = build_pipeline_result(location, parsed_data)
         
         logger.info("Successfully parsed OpenAI response")
-        return result
+        return result, extract_token_usage(response)
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
-        return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories())
+        return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories(), error_message=f"Error fetching from OpenAI: {e}"), TokenUsage()
 
 # def run_bedrock_analysis(latitude: str, longitude: str, location: str) -> PipelineResult:
 #     logger.info("Starting Bedrock analysis pipeline")
@@ -170,9 +181,9 @@ def run_openai_analysis(latitude: str, longitude: str, location: str) -> Pipelin
 #         return result
 #     except Exception as e:
 #         logger.error(f"Bedrock error: {e}")
-#         return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories())
+#         return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories(), error_message=f"Error fetching from Bedrock: {e}")
 
-def run_groq_analysis(latitude: str, longitude: str, location: str) -> PipelineResult:
+def run_groq_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
     logger.info("Starting Groq analysis pipeline")
     context = get_search_context(location)
     
@@ -202,10 +213,10 @@ def run_groq_analysis(latitude: str, longitude: str, location: str) -> PipelineR
         result = build_pipeline_result(location, parsed_data)
         
         logger.info("Successfully parsed Groq response")
-        return result
+        return result, extract_token_usage(response)
     except Exception as e:
         logger.error(f"Groq error: {e}")
-        return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories())
+        return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories(), error_message=f"Error fetching from Groq: {e}"), TokenUsage()
 
 def get_trend_search_context(location: str) -> str:
     """Uses DuckDuckGo to search for price trends over the last 3 years."""
@@ -235,7 +246,7 @@ def get_trend_search_context(location: str) -> str:
         logger.error(f"Search error for trend: {e}")
         return "No search data available."
 
-def run_openai_trend_analysis(latitude: str, longitude: str, location: str) -> str:
+def run_openai_trend_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
     logger.info("Starting OpenAI trend analysis pipeline")
     context = get_trend_search_context(location)
     formatted_prompt = STAGE2_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
@@ -253,12 +264,12 @@ def run_openai_trend_analysis(latitude: str, longitude: str, location: str) -> s
             content = content.split("```html")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-        return content
+        return content, extract_token_usage(response)
     except Exception as e:
         logger.error(f"OpenAI trend error: {e}")
-        return "Error fetching trend analysis from OpenAI."
+        return f"Error fetching trend analysis from OpenAI: {e}", TokenUsage()
 
-def run_groq_trend_analysis(latitude: str, longitude: str, location: str) -> str:
+def run_groq_trend_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
     logger.info("Starting Groq trend analysis pipeline")
     context = get_trend_search_context(location)
     formatted_prompt = STAGE2_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
@@ -280,10 +291,10 @@ def run_groq_trend_analysis(latitude: str, longitude: str, location: str) -> str
             content = content.split("```html")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-        return content
+        return content, extract_token_usage(response)
     except Exception as e:
         logger.error(f"Groq trend error: {e}")
-        return "Error fetching trend analysis from Groq."
+        return f"Error fetching trend analysis from Groq: {e}", TokenUsage()
 
 def get_appreciation_search_context(location: str) -> str:
     """Uses DuckDuckGo to search for infrastructure, employment hubs, and appreciation drivers."""
@@ -314,7 +325,7 @@ def get_appreciation_search_context(location: str) -> str:
         logger.error(f"Search error for appreciation: {e}")
         return "No search data available."
 
-def run_openai_appreciation_analysis(latitude: str, longitude: str, location: str) -> str:
+def run_openai_appreciation_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
     logger.info("Starting OpenAI appreciation analysis pipeline")
     context = get_appreciation_search_context(location)
     formatted_prompt = STAGE3_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
@@ -323,7 +334,7 @@ def run_openai_appreciation_analysis(latitude: str, longitude: str, location: st
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a Real Estate Analysis AI. Output ONLY HTML. Do not output JSON or Markdown."},
+                {"role": "system", "content": "You are a Real Estate Appreciation Analysis AI. Output ONLY HTML. Do not output JSON or Markdown."},
                 {"role": "user", "content": formatted_prompt + "\n\nSearch Context:\n" + context}
             ]
         )
@@ -332,12 +343,12 @@ def run_openai_appreciation_analysis(latitude: str, longitude: str, location: st
             content = content.split("```html")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-        return content
+        return content, extract_token_usage(response)
     except Exception as e:
         logger.error(f"OpenAI appreciation error: {e}")
-        return "Error fetching appreciation analysis from OpenAI."
+        return f"Error fetching appreciation analysis from OpenAI: {e}", TokenUsage()
 
-def run_groq_appreciation_analysis(latitude: str, longitude: str, location: str) -> str:
+def run_groq_appreciation_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
     logger.info("Starting Groq appreciation analysis pipeline")
     context = get_appreciation_search_context(location)
     formatted_prompt = STAGE3_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
@@ -350,7 +361,7 @@ def run_groq_appreciation_analysis(latitude: str, longitude: str, location: str)
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a Real Estate Analysis AI. Output ONLY HTML. Do not output JSON or Markdown."},
+                {"role": "system", "content": "You are a Real Estate Appreciation Analysis AI. Output ONLY HTML. Do not output JSON or Markdown."},
                 {"role": "user", "content": formatted_prompt + "\n\nSearch Context:\n" + context}
             ]
         )
@@ -359,18 +370,17 @@ def run_groq_appreciation_analysis(latitude: str, longitude: str, location: str)
             content = content.split("```html")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-        return content
+        return content, extract_token_usage(response)
     except Exception as e:
         logger.error(f"Groq appreciation error: {e}")
-        return "Error fetching appreciation analysis from Groq."
+        return f"Error fetching appreciation analysis from Groq: {e}", TokenUsage()
 
-def run_openai_final_analysis(latitude: str, longitude: str, location: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> str:
+def run_openai_final_analysis(location: str, latitude: str, longitude: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> Tuple[str, TokenUsage]:
     logger.info("Starting OpenAI final analysis pipeline")
-    
     formatted_prompt = STAGE4_PROMPT.format(
-        latitude=latitude, 
-        longitude=longitude, 
         location=location,
+        latitude=latitude,
+        longitude=longitude,
         price_point_data=json.dumps(price_data),
         trend_data=json.dumps(trend_data),
         appreciation_data=json.dumps(appreciation_data)
@@ -389,18 +399,17 @@ def run_openai_final_analysis(latitude: str, longitude: str, location: str, pric
             content = content.split("```html")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-        return content
+        return content, extract_token_usage(response)
     except Exception as e:
         logger.error(f"OpenAI final analysis error: {e}")
-        return "Error fetching final analysis from OpenAI."
+        return f"Error fetching final analysis from OpenAI: {e}", TokenUsage()
 
-def run_groq_final_analysis(latitude: str, longitude: str, location: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> str:
+def run_groq_final_analysis(location: str, latitude: str, longitude: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> Tuple[str, TokenUsage]:
     logger.info("Starting Groq final analysis pipeline")
-    
     formatted_prompt = STAGE4_PROMPT.format(
-        latitude=latitude, 
-        longitude=longitude, 
         location=location,
+        latitude=latitude,
+        longitude=longitude,
         price_point_data=json.dumps(price_data),
         trend_data=json.dumps(trend_data),
         appreciation_data=json.dumps(appreciation_data)
@@ -423,7 +432,7 @@ def run_groq_final_analysis(latitude: str, longitude: str, location: str, price_
             content = content.split("```html")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-        return content
+        return content, extract_token_usage(response)
     except Exception as e:
         logger.error(f"Groq final analysis error: {e}")
-        return "Error fetching final analysis from Groq."
+        return f"Error fetching final analysis from Groq: {e}", TokenUsage()

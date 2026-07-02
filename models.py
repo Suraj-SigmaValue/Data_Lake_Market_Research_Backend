@@ -53,21 +53,34 @@ class PipelineResult(BaseModel):
     location: str
     location_identification: LocationIdentification
     property_categories: PropertyCategories
+    error_message: Optional[str] = None
+
+class TokenUsage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
 
 class AnalyzeResponse(BaseModel):
     location: str
     openai_result: PipelineResult
     groq_result: PipelineResult
+    openai_tokens: TokenUsage
+    groq_tokens: TokenUsage
+
 
 class TrendResponse(BaseModel):
     location: str
     openai_trend: str
     groq_trend: str
+    openai_tokens: TokenUsage
+    groq_tokens: TokenUsage
 
 class AppreciationResponse(BaseModel):
     location: str
     openai_appreciation: str
     groq_appreciation: str
+    openai_tokens: TokenUsage
+    groq_tokens: TokenUsage
 
 class FinalAnalysisRequest(BaseModel):
     location: str
@@ -81,3 +94,5 @@ class FinalAnalysisResponse(BaseModel):
     location: str
     openai_analysis: str
     groq_analysis: str
+    openai_tokens: TokenUsage
+    groq_tokens: TokenUsage
