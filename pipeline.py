@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 from ddgs import DDGS
 from typing import Tuple
+import trafilatura
 from models import PipelineResult, LocationIdentification, PropertyCategories, PropertyListing, TokenUsage
 from prompt import STAGE1_PROMPT, STAGE2_PROMPT, STAGE3_PROMPT, STAGE4_PROMPT
 
@@ -29,18 +30,26 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 def scrape_page(url: str) -> str:
-    """Safely fetch and extract text from a webpage."""
+    """Safely fetch and extract text from a webpage using trafilatura."""
     try:
+        downloaded = trafilatura.fetch_url(url)
+        if downloaded:
+            result = trafilatura.extract(downloaded, include_tables=True, include_links=False)
+            if result:
+                return result[:8000] # Cap to 8000 chars per page to avoid overloading
+        
+        # Fallback to BeautifulSoup if trafilatura fails
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, 'html.parser')
-            for script in soup(["script", "style", "nav", "footer"]):
+            for script in soup(["script", "style", "nav", "footer", "aside"]):
                 script.extract()
             text = soup.get_text(separator=' ', strip=True)
-            return text[:8000] # Cap to 8000 chars per page to avoid overloading
+            return text[:8000]
         return ""
-    except Exception:
+    except Exception as e:
+        logger.error(f"Scrape error for {url}: {e}")
         return ""
 
 def get_search_context(location: str) -> str:

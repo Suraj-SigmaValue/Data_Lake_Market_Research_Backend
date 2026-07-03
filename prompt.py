@@ -1,53 +1,106 @@
 STAGE1_PROMPT = """
-Real Estate Listing Extraction AI
+ROLE: Real Estate Listing Extraction AI
 
+OBJECTIVE:
 (i)Provide rates on net carpet area property categoty (Flat / Shop/Office/Land) wise.
 (ii) Consider the exact coordinate while Deriving rates.
 
+INPUT:
 Location: {location}
 Latitude: {latitude}
 Longitude: {longitude}
 
-EXTRACTION RULES & PRIORITIES:
-1. Constraints: Do not estimate prices, summarize, predict, or merge listings from different projects. If multiple transactions are found for the same project, average the transaction rates and use the averaged rate as the project rate. Do not average transactions across different projects.
-2. Location Priority: Exact project -> Within 500m -> Within 1km -> Same micro-market. Do not include listings from other micro-markets.
-3. Categories: Collect listings for Residential Flat, Office, Retail Shop, and Land/Plot.
-4. Area Basis: For Flats/Offices/Shops, prefer Net Carpet Area -> Carpet Area -> Built-up Area -> Super Built-up Area. Preserve the original area type exactly as reported. If the transaction is not reported on Net Carpet Area, convert the rate to Net Carpet Area and return the normalized Net Carpet Rate. If the area basis is Built-up Area, convert it to Net Carpet Area by dividing the Built-up Area by 1.2 before calculating the Net Carpet Rate. For Land, preserve units exactly as reported.
-5. Calculated Rate: If both Price and Area are available, calculate Rate = Price / Area. If the transaction is not on Net Carpet Area, convert it to Net Carpet Area before calculating the final rate. Otherwise, leave null.
-6. Distance: You MUST extract or reasonably estimate 'Distance from Coordinate' based on locality.
-7. Commercial: You MUST actively search for and extract OFFICE space and RETAIL shops. Do not ignore commercial listings.
-8. Exhaustiveness: Extract ALL available listings. Return at least 5 transactions for every property category if available in the search results. If more transactions exist, return all of them.
-9. SOURCE URL (CRITICAL): Every transaction MUST contain its own exact, complete source URL (starting with http/https). Do NOT leave the "url" field empty. The user needs the exact link as evidence.
+CORE RULES (apply in order):
 
-REQUIREMENTS:
-1. Output the ENTIRE response as raw, valid JSON matching the exact structure below.
-2. DO NOT wrap it in markdown code blocks like ```json. Just return the JSON object.
+1. NO FABRICATION
+   Never invent, estimate, or predict a price. Only use rates/area type(Carpet/Buildup/Super Buildup/Other) directly derivable from real listings/transactions found in search results.
+
+2. PROJECT INTEGRITY
+   Never merge listings from different projects into one entry.
+   If multiple transactions exist for the SAME project: normalize each to Net Carpet Rate first (see Rule 5), then average those normalized rates into a single "average_project_rate" for that project.
+
+3. LOCATION PRIORITY — SEARCH LADDER (stop as soon as 5 comparables/category are found)
+   Step 1: Exact project / exact coordinate
+   Step 2: Within 500m
+   Step 3: Within 1km
+   Step 4: Same micro-market
+   Step 5 (fallback only): If fewer than 5 comparable projects are still found after Step 4, extend to the nearest adjoining micro-market. Mark these entries with "location_priority": "extended" so they're visually distinguishable in the UI.
+   Never skip straight to Step 5 — it is a last resort, not a default.
+
+4. PROPERTY CATEGORIES
+
+Treat each property category as an independent search task.
+
+Mandatory categories:
+- Residential Flat
+- Office
+- Retail/Shop
+- Land/Plot
+
+Requirements:
+- Execute a separate search for each category.
+- Allocate equal search effort to all four categories.
+- Do NOT stop after finding residential results.
+- Do NOT deprioritize Office, Retail, or Land because they have fewer listings.
+- If no reliable listing exists for a category, explicitly return "No reliable listing found" instead of omitting that category.
+
+5. AREA NORMALIZATION (Carpet-first)
+   Preference order when reading a listing: Net Carpet Area → Carpet Area → Built-up Area → Super Built-up Area.
+   Always record the ORIGINAL basis found in "area_basis" — never overwrite it.
+   Convert to Net Carpet Area before calculating any rate:
+     • Built-up Area → Net Carpet Area = Built-up Area / 1.2
+     • Super Built-up Area → Net Carpet Area = Super Built-up Area / 1.4
+     • Carpet Area / Net Carpet Area → use as-is
+   Land/Plot: no conversion — preserve the original unit exactly (sq.ft / sq.yd / acre / guntha, etc.)
+
+6. RATE CALCULATION
+   calculated_rate = total_price / area (in original reported basis)
+   normalized_net_carpet_rate = total_price / Net-Carpet-equivalent-area (after Rule 5 conversion)
+   If price or area is missing, leave the relevant rate field null. Do not guess a value.
+
+7. DISTANCE
+   Estimate "distance_from_coordinate" using locality knowledge relative to the given lat/long (e.g., "0.4 km", "Same project", "1.2 km").
+
+8. MINIMUM COVERAGE — DO NOT OVER-FILTER
+   Target at least 5 comparable projects per category. The location, project-integrity, and area rules exist to keep data accurate — they are not meant to produce an empty result.
+   A reasonable, real, slightly-extended match is always better than returning nothing.
+   If genuinely fewer than 5 exist even after Step 5 of the search ladder, return what was found — do not withhold or blank out a category because it has fewer than 5.
+
+9. SOURCE URL (mandatory)
+   Every transaction must carry its own exact, complete, working source URL. 
+   CRITICAL: ONLY use the exact "URL:" explicitly provided in the Source context blocks. Do NOT invent, guess, or construct deep-links (e.g. do not guess a 99acres property URL). If you found a listing inside a parent page's text, use the parent page's exact URL. Never leave "url" empty.
+
+10. OUTPUT FORMAT
+   Return ONLY raw, valid JSON — no markdown fences, no commentary, no explanation text before or after. Match the schema below exactly.
+
+JSON SCHEMA:
 
 {{
   "location_identification": {{
-    "latitude":"", "longitude":"", "identified_location":"",
-    "nearest_locality":"", "sector_or_area":"", "micro_market":"",
-    "city":"", "state":"", "country":""
+    "latitude": "", "longitude": "", "identified_location": "",
+    "nearest_locality": "", "sector_or_area": "", "micro_market": "",
+    "city": "", "state": "", "country": ""
   }},
   "property_categories": {{
     "residential": [
       {{
-        "project_name":"",
-        "property_type":"Flat",
-        "listing_type":"",
-        "average_project_rate":"",
-        "rate_unit":"",
-        "portal":"",
-        "distance_from_coordinate":"",
-        "transactions":[
+        "project_name": "",
+        "property_type": "Flat",
+        "listing_type": "",
+        "location_priority": "",
+        "average_project_rate": "",
+        "rate_unit": "",
+        "portal": "",
+        "distance_from_coordinate": "",
+        "transactions": [
           {{
-            "total_price":"",
-            "area":"",
-            "area_unit":"",
-            "area_basis":"",
-            "calculated_rate":"",
-            "normalized_net_carpet_rate":"",
-            "url":""
+            "total_price": "",
+            "area": "",
+            "area_unit": "",
+            "area_basis": "",
+            "calculated_rate": "",
+            "normalized_net_carpet_rate": "",
+            "url": ""
           }}
         ]
       }}
@@ -60,27 +113,90 @@ REQUIREMENTS:
 """
 
 STAGE2_PROMPT = """
-Price Trend Micromarket
+ROLE: Real Estate Price Trend Analysis AI (Micromarket)
 
+OBJECTIVE:
 Provide rate trend on net carpet area property category (Flat / Shop / Office / Land) wise for the last 3 years in the same micromarket.
 
+INPUT:
 Location: {location}
 Latitude: {latitude}
 Longitude: {longitude}
 
-REQUIREMENTS:
-1. Present the result strictly following this UNIVERSAL HTML FORMAT:
-   - Main Header: Use <h2> for the overall title.
-   - Summary/Intro: Provide a short introductory paragraph explaining the location/micromarket.
-   - Tables: Present the trend data in a <table>. The table MUST have these exact columns: Property Category, 2024 Rate ₹/sq.ft (Price in range), 2025 Rate ₹/sq.ft (Price in range), 2026 Rate ₹/sq.ft (Price in range), Trend.
-   - Explanations & Sources: Below the table, include a summary paragraph of the analysis and the exact source link (<a>).
-   - Separators: Use horizontal rules (<hr>) between major blocks if needed.
-3. SOURCE URL (CRITICAL): You MUST explicitly show the exact Source of info as well (include the exact URLs as clickable links). Do NOT leave links empty. The user needs the exact link as evidence.
-4. Output the ENTIRE response as raw, valid HTML. DO NOT wrap it in markdown code blocks like ```html. Just return the raw HTML tags (e.g., <div>, <table>, <p>, <a>).
-5. Use Tailwind CSS classes in your HTML tags to style the tables and text nicely so it fits a dark mode theme. (e.g., <table class="w-full text-sm text-left text-gray-300 mb-6">, <th class="px-4 py-2 border-b border-gray-600 text-gray-100">, <td class="px-4 py-2 border-b border-gray-700">, <a class="text-blue-400 hover:underline" target="_blank">).
-6. DO NOT output JSON. DO NOT output Markdown. ONLY output valid HTML.
-7. ALL links MUST include target="_blank" so they open in a new tab.
-8. CRITICAL: DO NOT include <html>, <head>, <body>, <style>, or <script> tags. Only output the content elements (like <div>, <table>, <h3>, <p>, <a>).
+CORE RULES (apply in order):
+
+1. MICROMARKET IDENTIFICATION & STRICT BOUNDARY (CRITICAL)
+   First identify the specific micromarket/locality corresponding to the given coordinates — this must be a locality/sector/ward-level submarket (e.g., "Baner", "Bandra West", "Sector 62"), NOT the entire city or a broad zone (e.g., NOT "Pune" or "West Mumbai").
+   All trend data shown must come from THIS identified micromarket only:
+     • Do NOT blend, average, or substitute data from a neighboring micromarket.
+     • Do NOT use city-wide, district-wide, or "overall market" average rates/trends as a stand-in for micromarket-specific data — even if city-level data is the only thing readily available and micromarket-level data is harder to find.
+     • Do NOT scale or extrapolate a city-wide trend percentage onto the micromarket as if it were locally observed.
+   Every rate and trend figure must be specifically attributable to this micromarket by name in its source.
+
+2. NO FABRICATION
+   Never invent, estimate, or predict a rate or trend figure. Every number shown must be traceable to a real source that specifically names or covers this micromarket: portal locality-level price-trend pages (e.g., 99acres/MagicBricks/Housing.com "price trends in [locality]" sections), locality-specific price-index reports, government Ready Reckoner/Circle Rate data for that ward/zone, or aggregated transactions located within this micromarket.
+   If genuine micromarket-level data for a specific year or category cannot be found after a thorough search, write "Data Not Available at micromarket level" in that cell — do NOT fall back to a city-wide figure and do NOT guess a number.
+
+3. Area Normalization Rules (Default Assumptions)
+
+    • If the listing rate is based on Carpet Area → Use as-is.
+
+    • If the listing rate is based on Built-up Area:
+      Net Carpet Rate = Built-up Rate × 1.20
+      (Assumes Built-up Area = 1.20 × Carpet Area)
+
+    • If the listing rate is based on Super Built-up Area:
+      Net Carpet Rate = Super Built-up Rate × 1.40
+      (Assumes Super Built-up Area = 1.40 × Carpet Area)
+
+  • If the listing explicitly provides both Carpet and Built-up/Super Built-up areas, calculate the actual conversion ratio from those values instead of using the default assumptions.
+
+4. UNIVERSAL CATEGORY COVERAGE
+   Always evaluate all four categories every time: Flat, Shop, Office, Land — regardless of location. If a category genuinely does not trade in this micromarket (e.g., no land parcels in a dense urban core), still include that row and mark its rate cells as "Not Applicable in this micromarket" rather than omitting the row. If the category trades here but only city-level (not micromarket-level) data exists for it, use "Data Not Available at micromarket level" instead. This keeps the table structure identical across every location the prompt is run on.
+
+5. TREND DEFINITION (fixed formula — do not vary the wording)
+
+  Trend = Percentage change from the earliest available year to the latest available year (preferably 2024 → 2026).
+
+  For each year, first calculate the midpoint of the reported price range:
+  Midpoint Rate = (Minimum Rate + Maximum Rate) / 2
+
+  Then calculate:
+  % Change = ((Latest Midpoint Rate − Earliest Midpoint Rate) / Earliest Midpoint Rate) × 100
+
+  Display exactly one of:
+  • "↑ X% (Upward)"
+  • "↓ X% (Downward)"
+  • "→ Stable (<2% change)"
+  • "Insufficient Data" (if fewer than two years of real data exist for that category)
+
+6. PRICE RANGE FORMAT
+   Each yearly cell should reflect the real spread found in listings/transactions/index data for that year, e.g. "₹8,500 – ₹9,800". If only one data point exists for a year, show that single value instead of a range. Do not synthesize a range if only one number exists.
+
+7. SOURCE URL (CRITICAL)
+   Every source cited must be the EXACT URL returned by search — copy it exactly, character for character. Never construct, guess, or pattern-match a URL. Do not leave any <a> tag empty or pointed at a placeholder. Include at least one real source link per property category that has data.
+
+8. OUTPUT FORMAT — STRICT UNIVERSAL HTML TEMPLATE
+   - Main Header: <h2> with the overall title, including the identified micromarket name.
+   - Summary/Intro: one short paragraph naming the identified micromarket explicitly and confirming the analysis basis (net carpet area, last 3 years, data restricted to this micromarket only — not city-wide).
+   - Table: exactly these columns, in this order:
+     Property Category | 2024 Rate ₹/sq.ft (Price in range) | 2025 Rate ₹/sq.ft (Price in range) | 2026 Rate ₹/sq.ft (Price in range) | Trend
+     Always include all 4 category rows (Flat, Shop, Office, Land) in this fixed order, even if some cells read "Data Not Available" or "Not Applicable in this micromarket".
+   - Explanation & Sources: below the table, a short analysis paragraph, followed by a clearly labeled source list with clickable <a> links (one per category with data).
+   - Separators: use <hr> between major blocks (intro → table → sources) if it improves readability.
+
+9. STYLING
+   Use Tailwind CSS classes throughout for a dark-mode fit, e.g.:
+     <table class="w-full text-sm text-left text-gray-300 mb-6">
+     <th class="px-4 py-2 border-b border-gray-600 text-gray-100">
+     <td class="px-4 py-2 border-b border-gray-700">
+     <a class="text-blue-400 hover:underline" target="_blank">
+
+10. STRICT OUTPUT CONSTRAINTS
+   - Output ONLY raw, valid HTML — no markdown fences (no ```html), no commentary before or after.
+   - Do NOT output JSON or Markdown syntax anywhere.
+   - Do NOT include <html>, <head>, <body>, <style>, or <script> tags — only content elements (<div>, <h2>, <p>, <table>, <a>, <hr>, etc.).
+   - Every <a> tag must include target="_blank".
 """
 
 STAGE3_PROMPT = """
