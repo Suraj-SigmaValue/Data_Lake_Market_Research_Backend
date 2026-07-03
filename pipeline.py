@@ -6,8 +6,9 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from openai import OpenAI
 from ddgs import DDGS
-from typing import Tuple
+from typing import Tuple, List
 import trafilatura
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from models import PipelineResult, LocationIdentification, PropertyCategories, PropertyListing, TokenUsage
 from prompt import STAGE1_PROMPT, STAGE2_PROMPT, STAGE3_PROMPT, STAGE4_PROMPT
 
@@ -123,6 +124,96 @@ def build_pipeline_result(location: str, parsed_data: dict) -> PipelineResult:
     
     return PipelineResult(location=location, location_identification=loc_id, property_categories=cats)
 
+def fetch_project_urls(project_name: str, location: str) -> List[dict]:
+    if not project_name:
+        return []
+    logger.info(f"Fetching URLs for {project_name} in {location}")
+    try:
+        query = f"{project_name}, {location} property for sale listing"
+        
+        results = []
+        import time
+        for attempt in range(3):
+            try:
+                results = list(DDGS().text(query, max_results=10))
+                if results:
+                    break
+            except Exception as e:
+                logger.warning(f"DDGS attempt {attempt+1} failed for {project_name}: {e}")
+                time.sleep(1 + attempt)
+                
+        if not results:
+            logger.warning(f"No DDGS results found for {project_name}")
+            return []
+            
+        
+        context = ""
+        for r in results:
+            context += f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}\n\n"
+            
+        prompt = f"""
+You are a Real Estate URL Extractor.
+
+Extract all valid property listing URLs for the project "{project_name}" in "{location}" from the provided search context.
+
+Rules:
+- Extract only URLs that clearly correspond to the requested project or its property listings.
+- Accept listings from any legitimate source, including official project websites, real estate portals, brokerage websites, property marketplaces, or other trusted sources.
+- Preserve the portal or website name exactly as it appears.
+- Do not fabricate, modify, or guess URLs.
+- Do not include duplicate URLs.
+- If no valid listings are found, return an empty array.
+
+Output ONLY valid JSON in the following format:
+
+{{
+  "portal_listings": [
+    {{
+      "portal": "<website name>",
+      "url": "<listing URL>"
+    }}
+  ]
+}}
+
+Do not include markdown, explanations, or any additional text.
+
+Search Context:
+{context}
+"""
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        content = response.choices[0].message.content
+        data = parse_llm_json(content)
+        return data.get("portal_listings", [])
+    except Exception as e:
+        logger.error(f"Error fetching URLs for {project_name}: {e}")
+        return []
+
+def populate_project_urls(pipeline_result: PipelineResult) -> PipelineResult:
+    all_projects = []
+    all_projects.extend(pipeline_result.property_categories.residential)
+    all_projects.extend(pipeline_result.property_categories.office)
+    all_projects.extend(pipeline_result.property_categories.retail)
+    all_projects.extend(pipeline_result.property_categories.land)
+    
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_to_project = {
+            executor.submit(fetch_project_urls, p.project_name, pipeline_result.location): p 
+            for p in all_projects if p.project_name
+        }
+        for future in as_completed(future_to_project):
+            p = future_to_project[future]
+            try:
+                urls = future.result()
+                p.portal_listings = urls
+            except Exception as exc:
+                logger.error(f"{p.project_name} generated an exception: {exc}")
+                
+    return pipeline_result
+
 def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
     logger.info("Starting OpenAI analysis pipeline")
     context = get_search_context(location)
@@ -146,7 +237,10 @@ def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[P
         parsed_data = parse_llm_json(content)
         result = build_pipeline_result(location, parsed_data)
         
-        logger.info("Successfully parsed OpenAI response")
+        # Fetch portal listing URLs asynchronously
+        result = populate_project_urls(result)
+        
+        logger.info("Successfully parsed OpenAI response and fetched URLs")
         return result, extract_token_usage(response)
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
@@ -221,7 +315,10 @@ def run_groq_analysis(latitude: str, longitude: str, location: str) -> Tuple[Pip
         parsed_data = parse_llm_json(content)
         result = build_pipeline_result(location, parsed_data)
         
-        logger.info("Successfully parsed Groq response")
+        # Fetch portal listing URLs asynchronously
+        result = populate_project_urls(result)
+        
+        logger.info("Successfully parsed Groq response and fetched URLs")
         return result, extract_token_usage(response)
     except Exception as e:
         logger.error(f"Groq error: {e}")

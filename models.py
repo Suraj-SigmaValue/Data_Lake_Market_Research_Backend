@@ -27,6 +27,10 @@ class Transaction(BaseModel):
     url: Any = ""
     portal: Any = ""
 
+class PortalListing(BaseModel):
+    portal: str
+    url: str
+
 class PropertyListing(BaseModel):
     project_name: Any = ""
     property_type: Any = ""
@@ -42,6 +46,7 @@ class PropertyListing(BaseModel):
     url: Any = ""
     distance_from_coordinate: Any = ""
     transactions: List[Transaction] = []
+    portal_listings: List[PortalListing] = []
 
 class PropertyCategories(BaseModel):
     residential: List[PropertyListing] = []

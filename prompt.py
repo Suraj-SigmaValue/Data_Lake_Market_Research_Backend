@@ -19,13 +19,16 @@ CORE RULES (apply in order):
    Never merge listings from different projects into one entry.
    If multiple transactions exist for the SAME project: normalize each to Net Carpet Rate first (see Rule 5), then average those normalized rates into a single "average_project_rate" for that project.
 
-3. LOCATION PRIORITY — SEARCH LADDER (stop as soon as 5 comparables/category are found)
-   Step 1: Exact project / exact coordinate
-   Step 2: Within 500m
-   Step 3: Within 1km
-   Step 4: Same micro-market
-   Step 5 (fallback only): If fewer than 5 comparable projects are still found after Step 4, extend to the nearest adjoining micro-market. Mark these entries with "location_priority": "extended" so they're visually distinguishable in the UI.
-   Never skip straight to Step 5 — it is a last resort, not a default.
+3. LOCATION PRIORITY — SEARCH LADDER (stop as soon as at least 5 comparable projects are found)
+
+Step 1: Exact project or exact property coordinates.
+Step 2: Search the nearest comparable projects surrounding the subject property/location, prioritizing the closest locations first.
+Step 3: If insufficient comparables are found, progressively expand the search to nearby projects while remaining within the same micro-market.
+Step 4: If fewer than 5 comparable projects are still available, extend the search to the nearest adjoining micro-market.
+Step 5 (Fallback Only): Only after exhausting all nearby projects within the same micro-market should adjoining micro-markets be considered.
+Mark any comparables sourced from an adjoining micro-market with:
+"location_priority": "extended"
+Always prioritize the closest available projects. Never skip directly to adjoining micro-markets unless nearby projects within the same micro-market have been exhausted.
 
 4. PROPERTY CATEGORIES
 
