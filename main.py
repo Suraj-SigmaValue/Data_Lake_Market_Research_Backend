@@ -4,9 +4,9 @@ load_dotenv() # Load from the current backend/.env
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from models import AnalyzeRequest, AnalyzeResponse, TrendResponse, AppreciationResponse, FinalAnalysisRequest, FinalAnalysisResponse
+from models import AnalyzeRequest, AnalyzeResponse, TrendResponse, AppreciationResponse, FinalAnalysisRequest, FinalAnalysisResponse, ExtractListingsRequest, ExtractListingsResponse
 from pipeline import run_openai_analysis, run_groq_analysis, run_openai_trend_analysis, run_groq_trend_analysis, run_openai_appreciation_analysis, run_groq_appreciation_analysis, run_openai_final_analysis, run_groq_final_analysis
+from listing_extractor import run_extract_listings
 
 app = FastAPI(title="Data Lake Market Research API")
 
@@ -26,7 +26,6 @@ def read_root():
 def analyze_location(request: AnalyzeRequest):
     # Run pipelines concurrently or sequentially
     # For MVP, running sequentially
-    
     openai_res, openai_tok = run_openai_analysis(request.latitude, request.longitude, request.location)
     groq_res, groq_tok = run_groq_analysis(request.latitude, request.longitude, request.location)
     
@@ -81,4 +80,12 @@ def final_analysis(request: FinalAnalysisRequest):
         groq_analysis=groq_res,
         openai_tokens=openai_tok,
         groq_tokens=groq_tok
+    )
+
+@app.post("/extract-listings", response_model=ExtractListingsResponse)
+def extract_listings_endpoint(request: ExtractListingsRequest):
+    valid_listings, token_usage = run_extract_listings(request.project_name, request.location, request.urls, request.provider)
+    return ExtractListingsResponse(
+        listings=valid_listings,
+        token_usage=token_usage
     )

@@ -17,35 +17,21 @@ class LocationIdentification(BaseModel):
     state: Any = ""
     country: Any = ""
 
-class Transaction(BaseModel):
-    total_price: Any = ""
-    area: Any = ""
-    area_unit: Any = ""
-    area_basis: Any = ""
-    calculated_rate: Any = ""
-    normalized_net_carpet_rate: Any = ""
-    url: Any = ""
-    portal: Any = ""
-
 class PortalListing(BaseModel):
     portal: str
     url: str
+    project_name: Optional[str] = ""
+    title: Optional[str] = ""
+    price: Optional[str] = ""
+    currency: Optional[str] = ""
+    area: Optional[str] = ""
+    area_type: Optional[str] = ""
+    location: Optional[str] = ""
 
 class PropertyListing(BaseModel):
     project_name: Any = ""
     property_type: Any = ""
-    listing_type: Any = ""
-    average_project_rate: Any = ""
-    total_price: Any = ""
-    area: Any = ""
-    area_unit: Any = ""
-    area_basis: Any = ""
-    calculated_rate: Any = ""
-    rate_unit: Any = ""
-    portal: Any = ""
-    url: Any = ""
     distance_from_coordinate: Any = ""
-    transactions: List[Transaction] = []
     portal_listings: List[PortalListing] = []
 
 class PropertyCategories(BaseModel):
@@ -64,6 +50,7 @@ class TokenUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    call_count: int = 0
 
 class AnalyzeResponse(BaseModel):
     location: str
@@ -101,3 +88,13 @@ class FinalAnalysisResponse(BaseModel):
     groq_analysis: str
     openai_tokens: TokenUsage
     groq_tokens: TokenUsage
+
+class ExtractListingsRequest(BaseModel):
+    project_name: str
+    location: str
+    urls: List[dict]
+    provider: str = "openai"
+
+class ExtractListingsResponse(BaseModel):
+    listings: List[PortalListing]
+    token_usage: TokenUsage

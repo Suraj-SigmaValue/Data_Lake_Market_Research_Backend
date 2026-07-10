@@ -7,3 +7,7 @@ boto3
 duckduckgo-search
 pytest
 trafilatura
+undetected-chromedriver
+selenium
+setuptools
+geopy

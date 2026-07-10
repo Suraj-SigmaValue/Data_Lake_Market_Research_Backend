@@ -9,17 +9,19 @@ from ddgs import DDGS
 from typing import Tuple, List
 import trafilatura
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from models import PipelineResult, LocationIdentification, PropertyCategories, PropertyListing, TokenUsage
+from models import PipelineResult, LocationIdentification, PropertyCategories, PropertyListing, TokenUsage, PortalListing
 from prompt import STAGE1_PROMPT, STAGE2_PROMPT, STAGE3_PROMPT, STAGE4_PROMPT
-
+import time
+from listing_extractor import fetch_project_urls
 def extract_token_usage(response) -> TokenUsage:
     if hasattr(response, 'usage') and response.usage:
         return TokenUsage(
             input_tokens=response.usage.prompt_tokens or 0,
             output_tokens=response.usage.completion_tokens or 0,
-            total_tokens=response.usage.total_tokens or 0
+            total_tokens=response.usage.total_tokens or 0,
+            call_count=1
         )
-    return TokenUsage()
+    return TokenUsage(call_count=1)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,7 +37,11 @@ def scrape_page(url: str) -> str:
     try:
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
-            result = trafilatura.extract(downloaded, include_tables=True, include_links=False)
+            result = trafilatura.extract(
+                                         downloaded, 
+                                         include_tables=True, 
+                                         include_links=False
+                                         )
             if result:
                 return result[:8000] # Cap to 8000 chars per page to avoid overloading
         
@@ -48,25 +54,31 @@ def scrape_page(url: str) -> str:
                 script.extract()
             text = soup.get_text(separator=' ', strip=True)
             return text[:8000]
-        return ""
+        else:
+            logger.warning(f"requests got status {resp.status_code} for {url}. Skipping.")
+            return ""
     except Exception as e:
-        logger.error(f"Scrape error for {url}: {e}")
+        logger.warning(f"Scrape failed for {url}: {e}")
         return ""
 
-def get_search_context(location: str) -> str:
-    """Uses DuckDuckGo to find real estate portals and scrapes the actual pages for maximum data."""
-    logger.info(f"Starting expanded DuckDuckGo search + deep scraping for location: {location}")
+def get_search_context(location: str, target_category: str) -> str:
+    """Uses DuckDuckGo to find real estate portals and scrapes the actual pages for maximum data for a specific category."""
+    logger.info(f"Starting expanded DuckDuckGo search + deep scraping for location: {location}, category: {target_category}")
     try:
-        queries = [
-            f"1 BHK 2 BHK 3 BHK flats for sale in {location} price",
-            f"commercial office space properties for sale in {location} price",
-            f"commercial shops retail showrooms for sale in {location} price",
-            f"residential plots land for sale in {location} price"
-        ]
+        if target_category == "residential":
+            queries = [f"1 BHK 2 BHK 3 BHK flats apartment for sale in {location} price"]
+        elif target_category == "office":
+            queries = [f"commercial office space properties for sale in {location} price"]
+        elif target_category == "retail":
+            queries = [f"commercial shops retail showrooms for sale in {location} price"]
+        elif target_category == "land":
+            queries = [f"residential plots land for sale in {location} price"]
+        else:
+            queries = [f"properties for sale in {location} price"]
         
         context = ""
         for query in queries:
-            results = list(DDGS().text(query, max_results=10))
+            results = list(DDGS().text(query))
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
@@ -124,104 +136,40 @@ def build_pipeline_result(location: str, parsed_data: dict) -> PipelineResult:
     
     return PipelineResult(location=location, location_identification=loc_id, property_categories=cats)
 
-def fetch_project_urls(project_name: str, location: str) -> List[dict]:
-    if not project_name:
-        return []
-    logger.info(f"Fetching URLs for {project_name} in {location}")
-    try:
-        query = f"{project_name}, {location} property for sale listing"
-        
-        results = []
-        import time
-        for attempt in range(3):
-            try:
-                results = list(DDGS().text(query, max_results=10))
-                if results:
-                    break
-            except Exception as e:
-                logger.warning(f"DDGS attempt {attempt+1} failed for {project_name}: {e}")
-                time.sleep(1 + attempt)
-                
-        if not results:
-            logger.warning(f"No DDGS results found for {project_name}")
-            return []
-            
-        
-        context = ""
-        for r in results:
-            context += f"Title: {r.get('title')}\nURL: {r.get('href')}\nSnippet: {r.get('body')}\n\n"
-            
-        prompt = f"""
-You are a Real Estate URL Extractor.
-
-Extract all valid property listing URLs for the project "{project_name}" in "{location}" from the provided search context.
-
-Rules:
-- Extract only URLs that clearly correspond to the requested project or its property listings.
-- Accept listings from any legitimate source, including official project websites, real estate portals, brokerage websites, property marketplaces, or other trusted sources.
-- Preserve the portal or website name exactly as it appears.
-- Do not fabricate, modify, or guess URLs.
-- Do not include duplicate URLs.
-- If no valid listings are found, return an empty array.
-
-Output ONLY valid JSON in the following format:
-
-{{
-  "portal_listings": [
-    {{
-      "portal": "<website name>",
-      "url": "<listing URL>"
-    }}
-  ]
-}}
-
-Do not include markdown, explanations, or any additional text.
-
-Search Context:
-{context}
-"""
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        content = response.choices[0].message.content
-        data = parse_llm_json(content)
-        return data.get("portal_listings", [])
-    except Exception as e:
-        logger.error(f"Error fetching URLs for {project_name}: {e}")
-        return []
-
-def populate_project_urls(pipeline_result: PipelineResult) -> PipelineResult:
-    all_projects = []
-    all_projects.extend(pipeline_result.property_categories.residential)
-    all_projects.extend(pipeline_result.property_categories.office)
-    all_projects.extend(pipeline_result.property_categories.retail)
-    all_projects.extend(pipeline_result.property_categories.land)
+def populate_project_urls(pipeline_result: PipelineResult, total_token_usage: TokenUsage = None) -> PipelineResult:
+    projects_with_category = []
+    for p in pipeline_result.property_categories.residential:
+        projects_with_category.append((p, "residential flat apartment"))
+    for p in pipeline_result.property_categories.office:
+        projects_with_category.append((p, "commercial office space"))
+    for p in pipeline_result.property_categories.retail:
+        projects_with_category.append((p, "commercial retail shop showroom"))
+    for p in pipeline_result.property_categories.land:
+        projects_with_category.append((p, "residential plot land"))
     
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        future_to_project = {
-            executor.submit(fetch_project_urls, p.project_name, pipeline_result.location): p 
-            for p in all_projects if p.project_name
-        }
-        for future in as_completed(future_to_project):
-            p = future_to_project[future]
+    for p, category in projects_with_category:
+        if p.project_name:
             try:
-                urls = future.result()
-                p.portal_listings = urls
+                import time
+                time.sleep(1.5) # Prevent 429 Too Many Requests from DDGS
+                urls, usage = fetch_project_urls(p.project_name, pipeline_result.location, category)
+                if total_token_usage:
+                    total_token_usage.input_tokens += usage.input_tokens
+                    total_token_usage.output_tokens += usage.output_tokens
+                    total_token_usage.total_tokens += usage.total_tokens
+                    total_token_usage.call_count += usage.call_count
+                p.portal_listings = [PortalListing(**item) for item in urls if isinstance(item, dict)]
             except Exception as exc:
                 logger.error(f"{p.project_name} generated an exception: {exc}")
                 
     return pipeline_result
 
-def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
-    logger.info("Starting OpenAI analysis pipeline")
-    context = get_search_context(location)
-    
-    formatted_prompt = STAGE1_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
+def run_openai_analysis_single_category(latitude: str, longitude: str, location: str, category: str) -> Tuple[dict, TokenUsage]:
+    logger.info(f"Starting OpenAI analysis for category: {category}")
+    context = get_search_context(location, category)
+    formatted_prompt = STAGE1_PROMPT.format(latitude=latitude, longitude=longitude, location=location, target_category=category)
     
     try:
-        logger.info("Calling OpenAI gpt-4o")
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -230,21 +178,58 @@ def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[P
             ],
             response_format={"type": "json_object"}
         )
-        
         content = response.choices[0].message.content
-        logger.info("Successfully received response from OpenAI")
-        
         parsed_data = parse_llm_json(content)
-        result = build_pipeline_result(location, parsed_data)
-        
-        # Fetch portal listing URLs asynchronously
-        result = populate_project_urls(result)
-        
-        logger.info("Successfully parsed OpenAI response and fetched URLs")
-        return result, extract_token_usage(response)
+        return parsed_data, extract_token_usage(response)
     except Exception as e:
-        logger.error(f"OpenAI error: {e}")
-        return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories(), error_message=f"Error fetching from OpenAI: {e}"), TokenUsage()
+        logger.error(f"OpenAI error for {category}: {e}")
+        return {}, TokenUsage()
+
+def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
+    logger.info("Starting OpenAI analysis pipeline (Concurrent)")
+    categories = ["residential", "office", "retail", "land"]
+    
+    all_parsed_data = {}
+    total_token_usage = TokenUsage()
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_category = {
+            executor.submit(run_openai_analysis_single_category, latitude, longitude, location, cat): cat
+            for cat in categories
+        }
+        
+        for future in as_completed(future_to_category):
+            cat = future_to_category[future]
+            try:
+                parsed_data, usage = future.result()
+                
+                # Merge location_identification from the first successful response
+                if not all_parsed_data.get("location_identification") and parsed_data.get("location_identification"):
+                    all_parsed_data["location_identification"] = parsed_data.get("location_identification")
+                
+                # Merge property_categories
+                if "property_categories" not in all_parsed_data:
+                    all_parsed_data["property_categories"] = {}
+                
+                if parsed_data.get("property_categories", {}).get(cat):
+                    all_parsed_data["property_categories"][cat] = parsed_data["property_categories"][cat]
+                else:
+                    if cat not in all_parsed_data["property_categories"]:
+                        all_parsed_data["property_categories"][cat] = []
+                        
+                total_token_usage.input_tokens += usage.input_tokens
+                total_token_usage.output_tokens += usage.output_tokens
+                total_token_usage.total_tokens += usage.total_tokens
+                total_token_usage.call_count += usage.call_count
+                
+            except Exception as exc:
+                logger.error(f"Category {cat} generated an exception: {exc}")
+    
+    result = build_pipeline_result(location, all_parsed_data)
+    result = populate_project_urls(result, total_token_usage)
+    
+    logger.info("Successfully parsed concurrent OpenAI response and fetched URLs")
+    return result, total_token_usage
 
 # def run_bedrock_analysis(latitude: str, longitude: str, location: str) -> PipelineResult:
 #     logger.info("Starting Bedrock analysis pipeline")
@@ -286,11 +271,10 @@ def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[P
 #         logger.error(f"Bedrock error: {e}")
 #         return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories(), error_message=f"Error fetching from Bedrock: {e}")
 
-def run_groq_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
-    logger.info("Starting Groq analysis pipeline")
-    context = get_search_context(location)
-    
-    formatted_prompt = STAGE1_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
+def run_groq_analysis_single_category(latitude: str, longitude: str, location: str, category: str) -> Tuple[dict, TokenUsage]:
+    logger.info(f"Starting Groq analysis for category: {category}")
+    context = get_search_context(location, category)
+    formatted_prompt = STAGE1_PROMPT.format(latitude=latitude, longitude=longitude, location=location, target_category=category)
     
     try:
         # Groq is compatible with the OpenAI SDK
@@ -310,31 +294,80 @@ def run_groq_analysis(latitude: str, longitude: str, location: str) -> Tuple[Pip
         )
         
         content = response.choices[0].message.content
-        logger.info("Successfully received response from Groq")
-        
         parsed_data = parse_llm_json(content)
-        result = build_pipeline_result(location, parsed_data)
-        
-        # Fetch portal listing URLs asynchronously
-        result = populate_project_urls(result)
-        
-        logger.info("Successfully parsed Groq response and fetched URLs")
-        return result, extract_token_usage(response)
+        return parsed_data, extract_token_usage(response)
     except Exception as e:
-        logger.error(f"Groq error: {e}")
-        return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories(), error_message=f"Error fetching from Groq: {e}"), TokenUsage()
+        logger.error(f"Groq error for {category}: {e}")
+        return {}, TokenUsage()
+
+def run_groq_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
+    logger.info("Starting Groq analysis pipeline (Concurrent)")
+    categories = ["residential", "office", "retail", "land"]
+    
+    all_parsed_data = {}
+    total_token_usage = TokenUsage()
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_category = {
+            executor.submit(run_groq_analysis_single_category, latitude, longitude, location, cat): cat
+            for cat in categories
+        }
+        
+        for future in as_completed(future_to_category):
+            cat = future_to_category[future]
+            try:
+                parsed_data, usage = future.result()
+                
+                # Merge location_identification
+                if not all_parsed_data.get("location_identification") and parsed_data.get("location_identification"):
+                    all_parsed_data["location_identification"] = parsed_data.get("location_identification")
+                
+                # Merge property_categories
+                if "property_categories" not in all_parsed_data:
+                    all_parsed_data["property_categories"] = {}
+                
+                if parsed_data.get("property_categories", {}).get(cat):
+                    all_parsed_data["property_categories"][cat] = parsed_data["property_categories"][cat]
+                else:
+                    if cat not in all_parsed_data["property_categories"]:
+                        all_parsed_data["property_categories"][cat] = []
+                        
+                total_token_usage.input_tokens += usage.input_tokens
+                total_token_usage.output_tokens += usage.output_tokens
+                total_token_usage.total_tokens += usage.total_tokens
+                total_token_usage.call_count += usage.call_count
+                
+            except Exception as exc:
+                logger.error(f"Category {cat} generated an exception: {exc}")
+    
+    result = build_pipeline_result(location, all_parsed_data)
+    result = populate_project_urls(result, total_token_usage)
+    
+    logger.info("Successfully parsed concurrent Groq response and fetched URLs")
+    return result, total_token_usage
 
 def get_trend_search_context(location: str) -> str:
     """Uses DuckDuckGo to search for price trends over the last 3 years."""
     logger.info(f"Starting DuckDuckGo search for trend analysis: {location}")
     try:
-        queries = [
-            f"property price trend last 3 years in {location}",
-            f"real estate rate trend {location} flat shop office land"
-        ]
+        categories = ["flat", "shop", "office", "land"]
+        queries = [f"property price trend last 3 years in {location}"]
+        for cat in categories:
+            queries.append(f"real estate rate trend {location} {cat}")
+            
         context = ""
+        import time
         for query in queries:
-            results = list(DDGS().text(query, max_results=10))
+            results = []
+            for attempt in range(3):
+                try:
+                    results = list(DDGS().text(query))
+                    if results:
+                        break
+                except Exception as e:
+                    logger.warning(f"DDGS attempt {attempt+1} failed for trend query: {e}")
+                    time.sleep(1 + attempt)
+                    
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
@@ -343,7 +376,7 @@ def get_trend_search_context(location: str) -> str:
                     page_text = scrape_page(url)
                 content_block = f"Source: {r.get('title')}\nURL: {url}\nSnippet: {snippet}\n"
                 if page_text:
-                    content_block += f"Page Content Extract:\n{page_text}\n"
+                    content_block += f"Page Content Extract:\n{page_text[:10000]}\n"
                 content_block += "\n"
                 if url not in context:
                     context += content_block
@@ -413,7 +446,7 @@ def get_appreciation_search_context(location: str) -> str:
         ]
         context = ""
         for query in queries:
-            results = list(DDGS().text(query, max_results=7))
+            results = list(DDGS().text(query))
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
