@@ -1,3 +1,5 @@
 .env
 __pycache__
 *.ipynb
+*.log
+test_prompt.py

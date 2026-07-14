@@ -2,6 +2,7 @@ import json
 import os
 import logging
 import requests
+import random
 from datetime import datetime
 from bs4 import BeautifulSoup
 from openai import OpenAI
@@ -13,6 +14,15 @@ from models import PipelineResult, LocationIdentification, PropertyCategories, P
 from prompt import STAGE1_PROMPT, STAGE2_PROMPT, STAGE3_PROMPT, STAGE4_PROMPT
 import time
 from listing_extractor import fetch_project_urls
+
+def _bedrock_client():
+    """Returns an OpenAI-compatible client pointed at the Bedrock Mantle endpoint."""
+    return OpenAI(
+        base_url=os.getenv("BEDROCK_BASE_URL", "https://bedrock-mantle.ap-south-1.api.aws/v1"),
+        api_key=os.getenv("BEDROCK_API_KEY")
+    )
+
+_BEDROCK_MODEL = os.getenv("LLM_MODEL")
 def extract_token_usage(response) -> TokenUsage:
     if hasattr(response, 'usage') and response.usage:
         return TokenUsage(
@@ -24,7 +34,14 @@ def extract_token_usage(response) -> TokenUsage:
     return TokenUsage(call_count=1)
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("backend.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Ensure you have your API keys loaded via dotenv in main.py
@@ -78,7 +95,7 @@ def get_search_context(location: str, target_category: str) -> str:
         
         context = ""
         for query in queries:
-            results = list(DDGS().text(query))
+            results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
@@ -136,6 +153,8 @@ def build_pipeline_result(location: str, parsed_data: dict) -> PipelineResult:
     
     return PipelineResult(location=location, location_identification=loc_id, property_categories=cats)
 
+import concurrent.futures
+
 def populate_project_urls(pipeline_result: PipelineResult, total_token_usage: TokenUsage = None) -> PipelineResult:
     projects_with_category = []
     for p in pipeline_result.property_categories.residential:
@@ -147,20 +166,28 @@ def populate_project_urls(pipeline_result: PipelineResult, total_token_usage: To
     for p in pipeline_result.property_categories.land:
         projects_with_category.append((p, "residential plot land"))
     
-    for p, category in projects_with_category:
-        if p.project_name:
-            try:
-                import time
-                time.sleep(1.5) # Prevent 429 Too Many Requests from DDGS
-                urls, usage = fetch_project_urls(p.project_name, pipeline_result.location, category)
-                if total_token_usage:
-                    total_token_usage.input_tokens += usage.input_tokens
-                    total_token_usage.output_tokens += usage.output_tokens
-                    total_token_usage.total_tokens += usage.total_tokens
-                    total_token_usage.call_count += usage.call_count
-                p.portal_listings = [PortalListing(**item) for item in urls if isinstance(item, dict)]
-            except Exception as exc:
-                logger.error(f"{p.project_name} generated an exception: {exc}")
+    def process_project(p, category):
+        if not p.project_name:
+            return None
+        try:
+            import time
+            time.sleep(random.uniform(0.5, 2.5)) # Jitter to prevent 429 Too Many Requests from DDGS
+            urls, usage = fetch_project_urls(p.project_name, pipeline_result.location, category, max_urls=15)
+            p.portal_listings = [PortalListing(**item) for item in urls if isinstance(item, dict)]
+            return usage
+        except Exception as exc:
+            logger.error(f"{p.project_name} generated an exception: {exc}")
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(process_project, p, cat): (p, cat) for p, cat in projects_with_category}
+        for future in concurrent.futures.as_completed(futures):
+            usage = future.result()
+            if usage and total_token_usage:
+                total_token_usage.input_tokens += usage.input_tokens
+                total_token_usage.output_tokens += usage.output_tokens
+                total_token_usage.total_tokens += usage.total_tokens
+                total_token_usage.call_count += usage.call_count
                 
     return pipeline_result
 
@@ -271,21 +298,17 @@ def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[P
 #         logger.error(f"Bedrock error: {e}")
 #         return PipelineResult(location=location, location_identification=LocationIdentification(), property_categories=PropertyCategories(), error_message=f"Error fetching from Bedrock: {e}")
 
-def run_groq_analysis_single_category(latitude: str, longitude: str, location: str, category: str) -> Tuple[dict, TokenUsage]:
-    logger.info(f"Starting Groq analysis for category: {category}")
+def run_bedrock_analysis_single_category(latitude: str, longitude: str, location: str, category: str) -> Tuple[dict, TokenUsage]:
+    logger.info(f"Starting Bedrock analysis for category: {category}")
     context = get_search_context(location, category)
     formatted_prompt = STAGE1_PROMPT.format(latitude=latitude, longitude=longitude, location=location, target_category=category)
     
     try:
-        # Groq is compatible with the OpenAI SDK
-        groq_client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=os.getenv("Groq_API_Key")
-        )
+        bedrock_client = _bedrock_client()
         
-        logger.info("Calling Groq llama-3.3-70b-versatile")
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        logger.info(f"Calling Bedrock model: {_BEDROCK_MODEL}")
+        response = bedrock_client.chat.completions.create(
+            model=_BEDROCK_MODEL,
             messages=[
                 {"role": "system", "content": "You are a Real Estate Extraction AI. Output ONLY valid JSON."},
                 {"role": "user", "content": formatted_prompt + "\n\nSearch Context:\n" + context}
@@ -297,11 +320,11 @@ def run_groq_analysis_single_category(latitude: str, longitude: str, location: s
         parsed_data = parse_llm_json(content)
         return parsed_data, extract_token_usage(response)
     except Exception as e:
-        logger.error(f"Groq error for {category}: {e}")
+        logger.error(f"Bedrock error for {category}: {e}")
         return {}, TokenUsage()
 
-def run_groq_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
-    logger.info("Starting Groq analysis pipeline (Concurrent)")
+def run_bedrock_analysis(latitude: str, longitude: str, location: str) -> Tuple[PipelineResult, TokenUsage]:
+    logger.info("Starting Bedrock analysis pipeline (Concurrent)")
     categories = ["residential", "office", "retail", "land"]
     
     all_parsed_data = {}
@@ -309,7 +332,7 @@ def run_groq_analysis(latitude: str, longitude: str, location: str) -> Tuple[Pip
     
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_category = {
-            executor.submit(run_groq_analysis_single_category, latitude, longitude, location, cat): cat
+            executor.submit(run_bedrock_analysis_single_category, latitude, longitude, location, cat): cat
             for cat in categories
         }
         
@@ -343,7 +366,7 @@ def run_groq_analysis(latitude: str, longitude: str, location: str) -> Tuple[Pip
     result = build_pipeline_result(location, all_parsed_data)
     result = populate_project_urls(result, total_token_usage)
     
-    logger.info("Successfully parsed concurrent Groq response and fetched URLs")
+    logger.info("Successfully parsed concurrent Bedrock response and fetched URLs")
     return result, total_token_usage
 
 def get_trend_search_context(location: str) -> str:
@@ -361,7 +384,7 @@ def get_trend_search_context(location: str) -> str:
             results = []
             for attempt in range(3):
                 try:
-                    results = list(DDGS().text(query))
+                    results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
                     if results:
                         break
                 except Exception as e:
@@ -408,18 +431,15 @@ def run_openai_trend_analysis(latitude: str, longitude: str, location: str) -> T
         logger.error(f"OpenAI trend error: {e}")
         return f"Error fetching trend analysis from OpenAI: {e}", TokenUsage()
 
-def run_groq_trend_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
-    logger.info("Starting Groq trend analysis pipeline")
+def run_bedrock_trend_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
+    logger.info("Starting Bedrock trend analysis pipeline")
     context = get_trend_search_context(location)
     formatted_prompt = STAGE2_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
     
     try:
-        groq_client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=os.getenv("Groq_API_Key")
-        )
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        bedrock_client = _bedrock_client()
+        response = bedrock_client.chat.completions.create(
+            model=_BEDROCK_MODEL,
             messages=[
                 {"role": "system", "content": "You are a Real Estate Trend Analysis AI. Output ONLY HTML. Do not output JSON or Markdown."},
                 {"role": "user", "content": formatted_prompt + "\n\nSearch Context:\n" + context}
@@ -432,8 +452,8 @@ def run_groq_trend_analysis(latitude: str, longitude: str, location: str) -> Tup
             content = content.split("```")[1].split("```")[0].strip()
         return content, extract_token_usage(response)
     except Exception as e:
-        logger.error(f"Groq trend error: {e}")
-        return f"Error fetching trend analysis from Groq: {e}", TokenUsage()
+        logger.error(f"Bedrock trend error: {e}")
+        return f"Error fetching trend analysis from Bedrock: {e}", TokenUsage()
 
 def get_appreciation_search_context(location: str) -> str:
     """Uses DuckDuckGo to search for infrastructure, employment hubs, and appreciation drivers."""
@@ -446,7 +466,7 @@ def get_appreciation_search_context(location: str) -> str:
         ]
         context = ""
         for query in queries:
-            results = list(DDGS().text(query))
+            results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
@@ -487,18 +507,15 @@ def run_openai_appreciation_analysis(latitude: str, longitude: str, location: st
         logger.error(f"OpenAI appreciation error: {e}")
         return f"Error fetching appreciation analysis from OpenAI: {e}", TokenUsage()
 
-def run_groq_appreciation_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
-    logger.info("Starting Groq appreciation analysis pipeline")
+def run_bedrock_appreciation_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
+    logger.info("Starting Bedrock appreciation analysis pipeline")
     context = get_appreciation_search_context(location)
     formatted_prompt = STAGE3_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
     
     try:
-        groq_client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=os.getenv("Groq_API_Key")
-        )
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        bedrock_client = _bedrock_client()
+        response = bedrock_client.chat.completions.create(
+            model=_BEDROCK_MODEL,
             messages=[
                 {"role": "system", "content": "You are a Real Estate Appreciation Analysis AI. Output ONLY HTML. Do not output JSON or Markdown."},
                 {"role": "user", "content": formatted_prompt + "\n\nSearch Context:\n" + context}
@@ -511,8 +528,8 @@ def run_groq_appreciation_analysis(latitude: str, longitude: str, location: str)
             content = content.split("```")[1].split("```")[0].strip()
         return content, extract_token_usage(response)
     except Exception as e:
-        logger.error(f"Groq appreciation error: {e}")
-        return f"Error fetching appreciation analysis from Groq: {e}", TokenUsage()
+        logger.error(f"Bedrock appreciation error: {e}")
+        return f"Error fetching appreciation analysis from Bedrock: {e}", TokenUsage()
 
 def run_openai_final_analysis(location: str, latitude: str, longitude: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> Tuple[str, TokenUsage]:
     logger.info("Starting OpenAI final analysis pipeline")
@@ -543,8 +560,8 @@ def run_openai_final_analysis(location: str, latitude: str, longitude: str, pric
         logger.error(f"OpenAI final analysis error: {e}")
         return f"Error fetching final analysis from OpenAI: {e}", TokenUsage()
 
-def run_groq_final_analysis(location: str, latitude: str, longitude: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> Tuple[str, TokenUsage]:
-    logger.info("Starting Groq final analysis pipeline")
+def run_bedrock_final_analysis(location: str, latitude: str, longitude: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> Tuple[str, TokenUsage]:
+    logger.info("Starting Bedrock final analysis pipeline")
     formatted_prompt = STAGE4_PROMPT.format(
         location=location,
         latitude=latitude,
@@ -555,12 +572,9 @@ def run_groq_final_analysis(location: str, latitude: str, longitude: str, price_
     )
     
     try:
-        groq_client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=os.getenv("Groq_API_Key")
-        )
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        bedrock_client = _bedrock_client()
+        response = bedrock_client.chat.completions.create(
+            model=_BEDROCK_MODEL,
             messages=[
                 {"role": "system", "content": "You are a Master Real Estate Analyst AI. Output ONLY HTML. Do not output JSON or Markdown."},
                 {"role": "user", "content": formatted_prompt}
@@ -573,5 +587,5 @@ def run_groq_final_analysis(location: str, latitude: str, longitude: str, price_
             content = content.split("```")[1].split("```")[0].strip()
         return content, extract_token_usage(response)
     except Exception as e:
-        logger.error(f"Groq final analysis error: {e}")
-        return f"Error fetching final analysis from Groq: {e}", TokenUsage()
+        logger.error(f"Bedrock final analysis error: {e}")
+        return f"Error fetching final analysis from Bedrock: {e}", TokenUsage()

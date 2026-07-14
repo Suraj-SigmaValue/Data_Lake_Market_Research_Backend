@@ -55,24 +55,24 @@ class TokenUsage(BaseModel):
 class AnalyzeResponse(BaseModel):
     location: str
     openai_result: PipelineResult
-    groq_result: PipelineResult
+    bedrock_result: PipelineResult
     openai_tokens: TokenUsage
-    groq_tokens: TokenUsage
+    bedrock_tokens: TokenUsage
 
 
 class TrendResponse(BaseModel):
     location: str
     openai_trend: str
-    groq_trend: str
+    bedrock_trend: str
     openai_tokens: TokenUsage
-    groq_tokens: TokenUsage
+    bedrock_tokens: TokenUsage
 
 class AppreciationResponse(BaseModel):
     location: str
     openai_appreciation: str
-    groq_appreciation: str
+    bedrock_appreciation: str
     openai_tokens: TokenUsage
-    groq_tokens: TokenUsage
+    bedrock_tokens: TokenUsage
 
 class FinalAnalysisRequest(BaseModel):
     location: str
@@ -85,15 +85,16 @@ class FinalAnalysisRequest(BaseModel):
 class FinalAnalysisResponse(BaseModel):
     location: str
     openai_analysis: str
-    groq_analysis: str
+    bedrock_analysis: str
     openai_tokens: TokenUsage
-    groq_tokens: TokenUsage
+    bedrock_tokens: TokenUsage
 
 class ExtractListingsRequest(BaseModel):
     project_name: str
     location: str
     urls: List[dict]
-    provider: str = "openai"
+    provider: str = "bedrock"
+    property_type: str
 
 class ExtractListingsResponse(BaseModel):
     listings: List[PortalListing]

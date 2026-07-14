@@ -29,7 +29,7 @@ Focus EXCLUSIVELY on extracting listings for the Target Property Category: {targ
 
 4. REQUIRED ATTRIBUTES
 Extract exactly 3 attributes per project:
-- project_name: Name of the real estate project.
+- project_name: The actual proper name of the real estate building, society, or project (e.g., "Bhakti Plaza", "Solitaire Business Hub"). CRITICAL: NEVER use generic listing titles or descriptions as project names (e.g., do NOT use "Office Space for sale in Aundh","Aundh Plot 1", or "Fully Furnished Office"). If a property does not belong to a specifically named project/building, skip it.
 - property_type: What type the property is (e.g., Flat, Shop, Office, Land).
 - distance_from_coordinate: How far the project is from the given coordinates (e.g. "0.4 km", "1.2 km").
 
