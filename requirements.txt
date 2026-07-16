@@ -12,3 +12,5 @@ selenium
 setuptools
 geopy
 tavily-python
+playwright
+scrapy

@@ -16,23 +16,15 @@ from models import TokenUsage
 from utils import parse_llm_json, extract_token_usage  # shared utils — avoids circular import
 
 try:
-    import trafilatura
-    TRAFILATURA_AVAILABLE = True
-except ImportError:
-    TRAFILATURA_AVAILABLE = False
-
-try:
-    import undetected_chromedriver as uc
-    from selenium.webdriver.common.by import By
-    UC_AVAILABLE = True
-except ImportError:
-    UC_AVAILABLE = False
-
-try:
     from tavily import TavilyClient as _TavilyClientLE
     _TAVILY_LE_AVAILABLE = True
 except ImportError:
     _TAVILY_LE_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Scraping layer — delegated to the modular scraper package
+# ---------------------------------------------------------------------------
+from scraper import scrape_page as scrape_listing_page  # noqa: E402
 
 
 def _tavily_search_le(query: str, max_results: int = 30) -> List[Dict]:
@@ -71,10 +63,7 @@ def _get_openai_client() -> OpenAI:
     return _openai_client
 
 
-# ---------------------------------------------------------------------------
-# Global Session & Scraping helpers
-# ---------------------------------------------------------------------------
-
+# Global requests Session (still used by fetch_project_urls URL discovery)
 _session = requests.Session()
 _adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
 _session.mount("http://", _adapter)
@@ -88,155 +77,6 @@ def _rich_useragent() -> str:
     )
 
 MIN_EXTRACTABLE_TEXT = 200
-
-def scrape_listing_page(url: str, text_limit: int = 8000) -> str:
-    """
-    Fetches page text using trafilatura (handles more JS-rendered pages than
-    raw requests) with a requests + BeautifulSoup fallback.
-    Returns up to `text_limit` characters of cleaned text.
-    """
-    # --- Strategy 1: trafilatura (handles many modern portals better) ---
-    if TRAFILATURA_AVAILABLE:
-        try:
-            downloaded = trafilatura.fetch_url(url)
-            if downloaded:
-                result = trafilatura.extract(
-                    downloaded,
-                    include_tables=True,
-                    include_links=False,
-                    no_fallback=False,
-                )
-                if result and len(result) >= MIN_EXTRACTABLE_TEXT:
-                    logger.debug(f"trafilatura OK for {url} ({len(result)} chars)")
-                    return result[:text_limit]
-        except Exception as e:
-            logger.debug(f"trafilatura failed for {url}: {e}")
-
-    # --- Strategy 2: requests + BeautifulSoup ---
-    try:
-        headers = {
-            "User-Agent": _rich_useragent(),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-IN,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
-        resp = _session.get(url, headers=headers, timeout=(5, 10))
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Remove clutter tags
-            for tag in soup(["script", "style", "nav", "footer",
-                             "aside", "header", "noscript", "iframe"]):
-                tag.extract()
-            text = soup.get_text(separator=" ", strip=True)
-            if text and len(text) >= MIN_EXTRACTABLE_TEXT:
-                logger.debug(f"requests+BS4 OK for {url} ({len(text)} chars)")
-                return text[:text_limit]
-        else:
-            logger.warning(f"requests+BS4 got HTTP {resp.status_code} for {url} — falling through to Selenium.")
-    except Exception as e:
-        logger.warning(f"requests+BS4 failed for {url}: {e}")
-
-    # --- Strategy 3: undetected_chromedriver (Selenium fallback for bot protection) ---
-    if UC_AVAILABLE:
-        logger.debug(f"Attempting undetected_chromedriver fallback for {url}")
-        driver = None
-        try:
-            import threading
-            if not hasattr(uc, '_init_lock'):
-                uc._init_lock = threading.Lock()
-            
-            options = uc.ChromeOptions()
-            options.headless = False # MUST BE FALSE to bypass Cloudflare bot protection!
-            
-            # Lock the driver instantiation to prevent concurrent patching issues on Windows
-            with uc._init_lock:
-                driver = uc.Chrome(options=options)
-                
-            driver.get(url)
-            
-            import time
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            
-            # Wait until readyState == complete
-            try:
-                WebDriverWait(driver, 15).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-            except Exception:
-                pass
-                
-            # Wait body exists
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-            except Exception:
-                pass
-                
-            body_element = driver.find_element(By.TAG_NAME, "body")
-            text = body_element.text
-            
-            # Extract length, if < 500, wait 3 seconds and try again
-            if len(text) < 500:
-                time.sleep(3)
-                text = body_element.text
-                
-            # If still < 500, do progressive scrolling
-            if len(text) < 500:
-                last_len = len(text)
-                stable_count = 0
-                
-                # Progressively scroll down to trigger lazy loading
-                for _ in range(6):
-                    # Popup clearer
-                    try:
-                        driver.execute_script("""
-                            document.body.style.overflow = 'auto';
-                            const buttons = Array.from(document.querySelectorAll('button, a, div, span'));
-                            const closeText = ['ok, got it', 'accept', 'i agree', 'close', 'allow'];
-                            for (let btn of buttons) {
-                                let t = (btn.innerText || '').toLowerCase().trim();
-                                if (closeText.includes(t) && btn.offsetHeight > 0) btn.click();
-                            }
-                        """)
-                    except Exception:
-                        pass
-                        
-                    # Scroll down by viewport
-                    driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
-                    time.sleep(2)
-                    
-                    text = body_element.text
-                    if len(text) == last_len:
-                        stable_count += 1
-                        # If DOM stopped changing and we have some content, break
-                        if stable_count >= 2 and len(text) > 200:
-                            break
-                    else:
-                        stable_count = 0
-                        
-                    last_len = len(text)
-
-            if text and len(text) >= MIN_EXTRACTABLE_TEXT:
-                logger.debug(f"undetected_chromedriver OK for {url} ({len(text)} chars)")
-                # Check if it's just a cloudflare captcha
-                if "verify you are human" not in text.lower():
-                    return text[:text_limit]
-            else:
-                logger.info(f"Page not fully loaded; waiting... ({len(text)} chars < {MIN_EXTRACTABLE_TEXT})")
-        except Exception as e:
-            logger.warning(f"undetected_chromedriver failed for {url}: {e}")
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-
-    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -351,16 +191,47 @@ def extract_listings_from_text(
     if not page_text or len(page_text) < MIN_EXTRACTABLE_TEXT:
         return [], TokenUsage()
 
-    # Normalise property type and pick a matching example to avoid confusing the LLM
+    # ── Dynamic example generation ─────────────────────────────────────────
+    # Build project-name match examples from the actual runtime project_name.
+    # This avoids hardcoding any specific project names inside the prompt.
+    pn_words = project_name.strip().split()
+    # Variant 1: last 2 significant words (e.g. "Life Republic" from "Kolte Patil Life Republic")
+    variant_short = " ".join(pn_words[-2:]) if len(pn_words) >= 2 else project_name
+    # Variant 2: the very last word, because portals often drop the developer name (e.g. "Minerva" for "Lokhandwala Minerva")
+    variant_shortest = pn_words[-1] if pn_words else project_name
+    # Variant 3: project name embedded in a description phrase (as portals write it)
+    variant_in    = f"in {project_name}"
+    variant_by    = f"{project_name} by"
+    variant_soc   = f"{project_name} society"
+
+    # Title type example — driven entirely by the requested category
     cat = property_type.lower().strip()
-    if cat == "office":
-        example_title = "Commercial Office Space"
+    if cat in ("office", "commercial"):
+        example_title    = "Commercial Office Space"
+        example_area     = "850"
+        example_area_type = "sq.ft. Carpet Area"
+        example_price    = "1.25 Cr"
     elif cat == "retail":
-        example_title = "Retail Shop"
+        example_title    = "Retail Shop"
+        example_area     = "620"
+        example_area_type = "sq.ft. Carpet Area"
+        example_price    = "85 Lacs"
     elif cat == "land":
-        example_title = "Residential Plot"
-    else:
-        example_title = "3 BHK Apartment"
+        example_title    = "Residential Plot"
+        example_area     = "2400"
+        example_area_type = "sq.ft. Plot Area"
+        example_price    = "45 Lacs"
+    else:  # residential / default
+        example_title    = f"Apartment in {project_name}"
+        example_area     = "1142"
+        example_area_type = "sq.ft. Carpet Area"
+        example_price    = "1.25 Cr"
+
+    # Separator hint — what portal search pages use to split listing blocks
+    listing_separators = (
+        '"Contact Agent", "Get Phone No", "Request Callback", '
+        '"Enquire Now", "Photos", "Posted:", or a new unit-type heading'
+    )
 
     prompt = f"""You are a highly accurate Real Estate Extraction Architecture AI.
 
@@ -374,53 +245,45 @@ LOCATION: "{location}"
 PROPERTY CATEGORY: "{property_type}"
 
 WEBPAGE CONTENT:
-{page_text[:8000]}
+{page_text[:12000]}
 ────────────────────────────────────────
-DYNAMIC SECTION UNDERSTANDING (STEP 1 & 2)
+PAGE AWARENESS
 ────────────────────────────────────────
-1. Mentally scan the webpage content and identify independent logical sections (e.g., "Overview", "Floor Plans", "Price List", "Recommended Properties", "Nearby Projects").
-2. Contextually classify the intent and property category of each section.
-3. COMPLETELY IGNORE sections belonging to other property categories.
-4. COMPLETELY IGNORE sections for "Recommended" or "Nearby" or "Related" projects.
+Data may be structured in rows/tables, OR scattered across multiple lines without column headers.
+You MUST scan forward and backward across lines within blocks to pair the area with the correct price.
 
 ────────────────────────────────────────
-VALIDATION PIPELINE (STEP 3 & 4)
+EXTRACTION INSTRUCTIONS
 ────────────────────────────────────────
-For each potential listing or configuration row in the RELEVANT sections, you MUST apply this exact mental pipeline:
+1. Scan the text for property listings matching the project name AND category.
+2. The project name may appear partially (e.g. just "{variant_shortest}" instead of "{project_name}"). Be lenient! As long as it's not clearly a different project, extract it.
+3. Every listing MUST have a price and an area to be valid. 
+4. Portals often glue text together (e.g., "₹ 30.84 Cr₹14.51 lakh EMI"). Extract only the main price.
+5. If the REQUESTED CATEGORY is office, commercial, or retail: Do NOT extract anything that says "BHK" or "Bedroom".
 
-Project Validation (Must clearly belong to the project. Accept if the exact name appears or a clearly abbreviated version of the same project appears. e.g. target "Naiknavare Seasons Business Square" matches "Seasons Business Square").
-↓
-Category Validation (Must match: {property_type})
-↓
-Listing Validation (Is it a real property configuration or listing?)
-↓
-Extraction
-↓
-Reject everything else
+Output all valid listings you find. If you find none, return {{"listings": []}}.
 
-SMART INFERENCE RULES:
-- You are allowed to use inference ONLY to understand page structure or to determine the category of an ambiguous listing using contextual headers/titles.
-- You must NEVER infer or change the Project Name or the Property Category itself. The requested Category is the absolute single source of truth.
-- CRITICAL RULE: If the REQUESTED CATEGORY is Commercial, Office, or Retail, you MUST strictly reject ANY listing that mentions "BHK", "Bedroom", or "Flat". Commercial spaces are never BHKs.
-
-OUTPUT:
-Return ONLY valid JSON.
+────────────────────────────────────────
+OUTPUT
+────────────────────────────────────────
+Return ONLY valid JSON — no markdown, no explanation.
 {{
   "listings": [
     {{
-      "project_name": "{project_name}",
-      "category": "{property_type}",
-      "title": "{example_title}",
-      "price": "1.25 Cr",
+      "project_name": "...",
+      "category": "...",
+      "title": "...",
+      "price": "...",
       "currency": "₹",
-      "area": "1142",
-      "area_type": "sq.ft. Carpet Area",
-      "location": "{location}"
+      "area": "...",
+      "area_type": "...",
+      "location": "..."
     }}
   ]
 }}
-If no listing perfectly passes the validation pipeline, return empty list: {{"listings": []}}
+If no listing passes all validation steps, return: {{"listings": []}}
 """
+
 
     try:
         llm_client, model_name = _build_llm_client(provider)
