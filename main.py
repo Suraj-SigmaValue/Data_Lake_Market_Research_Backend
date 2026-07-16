@@ -1,6 +1,16 @@
+import sys
 import os
+
+# Ensure the backend directory is always on sys.path so local modules
+# (pipeline, listing_extractor, models, prompt) are found even when
+# uvicorn's --reload spawns a child subprocess with a different cwd.
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
 from dotenv import load_dotenv
-load_dotenv() # Load from the current backend/.env
+load_dotenv()  # Load from the current backend/.env
+
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

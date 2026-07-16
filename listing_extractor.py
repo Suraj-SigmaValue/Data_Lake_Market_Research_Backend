@@ -2,7 +2,9 @@ import os
 import time
 import logging
 import hashlib
-from typing import Tuple, List, Optional
+import json
+import random
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from openai import OpenAI
 from ddgs import DDGS
@@ -11,11 +13,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from models import TokenUsage
-
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
-import random
-import time
+from utils import parse_llm_json, extract_token_usage  # shared utils — avoids circular import
 
 try:
     import trafilatura
@@ -29,6 +27,38 @@ try:
     UC_AVAILABLE = True
 except ImportError:
     UC_AVAILABLE = False
+
+try:
+    from tavily import TavilyClient as _TavilyClientLE
+    _TAVILY_LE_AVAILABLE = True
+except ImportError:
+    _TAVILY_LE_AVAILABLE = False
+
+
+def _tavily_search_le(query: str, max_results: int = 30) -> List[Dict]:
+    """Fallback: search via Tavily, returns results in the same {href, title, body} shape as DDGS."""
+    logger_le = logging.getLogger(__name__)
+    if not _TAVILY_LE_AVAILABLE:
+        return []
+    api_key = os.getenv("Tavily_API") or os.getenv("TAVILY_API_KEY") or os.getenv("TAVILY_API")
+    if not api_key:
+        logger_le.warning("Tavily API key not set. Skipping Tavily fallback.")
+        return []
+    try:
+        client_t = _TavilyClientLE(api_key=api_key)
+        response = client_t.search(query=query, max_results=max_results)
+        results = []
+        for r in response.get("results", []):
+            results.append({
+                "href": r.get("url", ""),
+                "title": r.get("title", ""),
+                "body": r.get("content", ""),
+            })
+        logger_le.info(f"Tavily returned {len(results)} results for '{query}'.")
+        return results
+    except Exception as e:
+        logger_le.warning(f"Tavily fallback failed for '{query}': {e}")
+        return []
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +87,8 @@ def _rich_useragent() -> str:
         "Chrome/124.0.0.0 Safari/537.36"
     )
 
+MIN_EXTRACTABLE_TEXT = 200
+
 def scrape_listing_page(url: str, text_limit: int = 8000) -> str:
     """
     Fetches page text using trafilatura (handles more JS-rendered pages than
@@ -74,7 +106,7 @@ def scrape_listing_page(url: str, text_limit: int = 8000) -> str:
                     include_links=False,
                     no_fallback=False,
                 )
-                if result and len(result) > 100:
+                if result and len(result) >= MIN_EXTRACTABLE_TEXT:
                     logger.debug(f"trafilatura OK for {url} ({len(result)} chars)")
                     return result[:text_limit]
         except Exception as e:
@@ -84,9 +116,13 @@ def scrape_listing_page(url: str, text_limit: int = 8000) -> str:
     try:
         headers = {
             "User-Agent": _rich_useragent(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-IN,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         }
-        resp = _session.get(url, headers=headers, timeout=(3, 5))
+        resp = _session.get(url, headers=headers, timeout=(5, 10))
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             # Remove clutter tags
@@ -94,9 +130,11 @@ def scrape_listing_page(url: str, text_limit: int = 8000) -> str:
                              "aside", "header", "noscript", "iframe"]):
                 tag.extract()
             text = soup.get_text(separator=" ", strip=True)
-            if text and len(text) > 50:
+            if text and len(text) >= MIN_EXTRACTABLE_TEXT:
                 logger.debug(f"requests+BS4 OK for {url} ({len(text)} chars)")
                 return text[:text_limit]
+        else:
+            logger.warning(f"requests+BS4 got HTTP {resp.status_code} for {url} — falling through to Selenium.")
     except Exception as e:
         logger.warning(f"requests+BS4 failed for {url}: {e}")
 
@@ -119,37 +157,76 @@ def scrape_listing_page(url: str, text_limit: int = 8000) -> str:
             driver.get(url)
             
             import time
-            time.sleep(5) # Wait for initial page load
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
             
-            # Attempt to clear common popups/disclaimers and force body scroll
+            # Wait until readyState == complete
             try:
-                driver.execute_script("""
-                    document.body.style.overflow = 'auto';
-                    const buttons = Array.from(document.querySelectorAll('button, a, div, span'));
-                    const closeText = ['ok, got it', 'accept', 'i agree', 'close', 'allow'];
-                    for (let btn of buttons) {
-                        let text = (btn.innerText || '').toLowerCase().trim();
-                        if (closeText.includes(text) && btn.offsetHeight > 0) {
-                            btn.click();
-                        }
-                    }
-                """)
-            except Exception as e:
+                WebDriverWait(driver, 15).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
                 pass
                 
-            # Scroll down to trigger lazy loading
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-            time.sleep(5) # Wait for lazy-loaded elements
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            
+            # Wait body exists
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+            except Exception:
+                pass
+                
             body_element = driver.find_element(By.TAG_NAME, "body")
             text = body_element.text
-            if text and len(text) > 50:
+            
+            # Extract length, if < 500, wait 3 seconds and try again
+            if len(text) < 500:
+                time.sleep(3)
+                text = body_element.text
+                
+            # If still < 500, do progressive scrolling
+            if len(text) < 500:
+                last_len = len(text)
+                stable_count = 0
+                
+                # Progressively scroll down to trigger lazy loading
+                for _ in range(6):
+                    # Popup clearer
+                    try:
+                        driver.execute_script("""
+                            document.body.style.overflow = 'auto';
+                            const buttons = Array.from(document.querySelectorAll('button, a, div, span'));
+                            const closeText = ['ok, got it', 'accept', 'i agree', 'close', 'allow'];
+                            for (let btn of buttons) {
+                                let t = (btn.innerText || '').toLowerCase().trim();
+                                if (closeText.includes(t) && btn.offsetHeight > 0) btn.click();
+                            }
+                        """)
+                    except Exception:
+                        pass
+                        
+                    # Scroll down by viewport
+                    driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
+                    time.sleep(2)
+                    
+                    text = body_element.text
+                    if len(text) == last_len:
+                        stable_count += 1
+                        # If DOM stopped changing and we have some content, break
+                        if stable_count >= 2 and len(text) > 200:
+                            break
+                    else:
+                        stable_count = 0
+                        
+                    last_len = len(text)
+
+            if text and len(text) >= MIN_EXTRACTABLE_TEXT:
                 logger.debug(f"undetected_chromedriver OK for {url} ({len(text)} chars)")
                 # Check if it's just a cloudflare captcha
                 if "verify you are human" not in text.lower():
                     return text[:text_limit]
+            else:
+                logger.info(f"Page not fully loaded; waiting... ({len(text)} chars < {MIN_EXTRACTABLE_TEXT})")
         except Exception as e:
             logger.warning(f"undetected_chromedriver failed for {url}: {e}")
         finally:
@@ -197,9 +274,7 @@ def _validate_extracted_listings(listings: List[dict], requested_category: str, 
         from models import TokenUsage
         return [], TokenUsage()
         
-    from pipeline import parse_llm_json, extract_token_usage
-    import json
-    from models import TokenUsage
+
     
     validation_prompt = f"""You are a strict Real Estate Semantic Validation AI.
 Your ONLY job is to verify if each extracted property listing truly belongs to the requested category.
@@ -208,6 +283,7 @@ REQUESTED CATEGORY: "{requested_category}"
 
 You MUST evaluate the semantics of each listing (title, price, area).
 If the listing is for a different category (e.g., Office when requested is Retail, or Apartment when requested is Land), you MUST reject it.
+CRITICAL RULE: If the REQUESTED CATEGORY is Commercial, Office, or Retail, you MUST strictly reject ANY listing that mentions "BHK", "Bedroom", or "Flat". Commercial spaces are never BHKs.
 If the listing is ambiguous but semantically plausible, you may accept it.
 NEVER modify the listings. Just return a boolean 'is_valid' for each.
 
@@ -237,14 +313,23 @@ Return ONLY valid JSON mapping the listing index to its validity.
         data = parse_llm_json(content)
         validation_results = data.get("validation", [])
         
+        if not validation_results:
+            # Validation LLM returned nothing useful — trust Pass 1 results
+            logger.warning("Pass 2 validation returned empty results — trusting Pass 1 output.")
+            return listings, extract_token_usage(response)
+
         valid_indices = {item["index"] for item in validation_results if item.get("is_valid")}
         filtered_listings = [listing for i, listing in enumerate(listings) if i in valid_indices]
         
+        if not filtered_listings and listings:
+            logger.warning(f"Pass 2 rejected ALL {len(listings)} listing(s) from Pass 1 — trusting Pass 1 output instead.")
+            return listings, extract_token_usage(response)
+        
         return filtered_listings, extract_token_usage(response)
     except Exception as e:
-        logger.error(f"Semantic validation error: {e}")
-        # If validation fails, fallback to strict rejection rather than risking contamination
-        return [], TokenUsage()
+        logger.error(f"Semantic validation error: {e} — trusting Pass 1 output.")
+        # If validation fails, fall back to Pass 1 results rather than silently dropping everything
+        return listings, TokenUsage()
 
 
 def extract_listings_from_text(
@@ -263,7 +348,7 @@ def extract_listings_from_text(
     """
     from pipeline import parse_llm_json, extract_token_usage
 
-    if not page_text or len(page_text) < 50:
+    if not page_text or len(page_text) < MIN_EXTRACTABLE_TEXT:
         return [], TokenUsage()
 
     # Normalise property type and pick a matching example to avoid confusing the LLM
@@ -316,6 +401,7 @@ Reject everything else
 SMART INFERENCE RULES:
 - You are allowed to use inference ONLY to understand page structure or to determine the category of an ambiguous listing using contextual headers/titles.
 - You must NEVER infer or change the Project Name or the Property Category itself. The requested Category is the absolute single source of truth.
+- CRITICAL RULE: If the REQUESTED CATEGORY is Commercial, Office, or Retail, you MUST strictly reject ANY listing that mentions "BHK", "Bedroom", or "Flat". Commercial spaces are never BHKs.
 
 OUTPUT:
 Return ONLY valid JSON.
@@ -327,8 +413,8 @@ Return ONLY valid JSON.
       "title": "{example_title}",
       "price": "1.25 Cr",
       "currency": "₹",
-      "area": "1142 sqft",
-      "area_type": "Carpet Area",
+      "area": "1142",
+      "area_type": "sq.ft. Carpet Area",
       "location": "{location}"
     }}
   ]
@@ -351,9 +437,13 @@ If no listing perfectly passes the validation pipeline, return empty list: {{"li
         extracted = data.get("listings", [])
 
         pass1_usage = extract_token_usage(response)
+        logger.info(f"Pass 1 extracted {len(extracted)} listing(s) from {url}")
         
         # Pass 2: Semantic Validation
         validated_extracted, pass2_usage = _validate_extracted_listings(extracted, property_type, provider)
+        
+        if len(validated_extracted) < len(extracted):
+            logger.info(f"Pass 2 kept {len(validated_extracted)}/{len(extracted)} listing(s) from {url}")
         
         # Combine token usage
         total_usage = TokenUsage()
@@ -411,9 +501,38 @@ async def _async_scrape_and_extract(
             result["error"] = f"Scraping error on {portal}: {exc}"
             return result
 
-        if not page_text or len(page_text) < 50:
+        if not page_text or len(page_text) < MIN_EXTRACTABLE_TEXT:
             result["status_messages"].append({"type": "status", "msg": f"No readable content on {portal} \u2014 skipping"})
             return result
+
+        # Save the text to a .txt file named after the portal for debugging/records
+        # (Only saved when content is actually usable by the LLM)
+        # Auto-cleanup: keep only the 5 most recent .txt files in the backend dir.
+        _TXT_KEEP_MAX = 10
+
+        def _save_file():
+            import glob
+            import re
+            # Sanitize project name to be filename-safe
+            safe_project = re.sub(r'[^a-zA-Z0-9_]', '', project_name.replace(' ', '_'))
+            filename = f"{safe_project}_{portal}.txt"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(page_text)
+
+            # Collect all .txt files in the same directory, sorted oldest-first (excluding requirements.txt)
+            txt_files = sorted(
+                [f for f in glob.glob("*.txt") if os.path.basename(f) != "requirements.txt"],
+                key=lambda p: os.path.getmtime(p),
+            )
+            # Delete oldest files beyond the cap
+            for old_file in txt_files[:-_TXT_KEEP_MAX]:
+                try:
+                    os.remove(old_file)
+                    logger.info(f"Auto-deleted old debug file: {old_file}")
+                except Exception as del_err:
+                    logger.warning(f"Could not delete {old_file}: {del_err}")
+
+        await asyncio.to_thread(_save_file)
 
         # Pre-filter: Valid HTML must contain real estate keywords
         page_text_lower = page_text.lower()
@@ -820,7 +939,7 @@ def fetch_project_urls(
 
     terms: List[str] = CATEGORY_TERMS.get(
         category,
-        CATEGORY_TERMS["property"],
+        CATEGORY_TERMS.get("property", ["property", "real estate", "listings", "for sale"]),
     )
 
     # ------------------------------------------------------------------
@@ -833,7 +952,7 @@ def fetch_project_urls(
         """
 
         return [
-            f'"{project_name}" {location} {terms[0]} sales listing'
+            f'"{project_name}" real estate project, {location} {terms[0]} sales listing'
         ]
 
     queries = build_queries()
@@ -993,6 +1112,15 @@ def fetch_project_urls(
         logger.error(
             f"Search failed after {MAX_RETRIES} attempts: {query}"
         )
+
+        # --- Fallback: Tavily ---
+        logger.info(f"Attempting Tavily fallback for query: {query}")
+        tavily_results = _tavily_search_le(query)
+        if tavily_results:
+            logger.info(f"Tavily returned {len(tavily_results)} results for '{query}'.")
+            return tavily_results
+        else:
+            logger.warning(f"Tavily also returned no results for '{query}'.")
 
         return []
 

@@ -11,3 +11,4 @@ undetected-chromedriver
 selenium
 setuptools
 geopy
+tavily-python

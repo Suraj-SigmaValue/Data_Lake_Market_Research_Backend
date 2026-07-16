@@ -13,7 +13,36 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from models import PipelineResult, LocationIdentification, PropertyCategories, PropertyListing, TokenUsage, PortalListing
 from prompt import STAGE1_PROMPT, STAGE2_PROMPT, STAGE3_PROMPT, STAGE4_PROMPT
 import time
-from listing_extractor import fetch_project_urls
+from utils import parse_llm_json, extract_token_usage  # shared utils — avoids circular import
+from tavily import TavilyClient as _TavilyClient
+
+try:
+    _TAVILY_AVAILABLE = True
+except ImportError:
+    _TAVILY_AVAILABLE = False
+
+
+def _tavily_search(query: str, max_results: int = 15) -> List[dict]:
+    """Fallback search via Tavily. Returns results in the same {href, title, body} shape as DDGS."""
+    if not _TAVILY_AVAILABLE:
+        return []
+    api_key = os.getenv("Tavily_API") or os.getenv("TAVILY_API_KEY") or os.getenv("TAVILY_API")
+    if not api_key:
+        return []
+    try:
+        client_t = _TavilyClient(api_key=api_key)
+        response = client_t.search(query=query, max_results=max_results)
+        results = []
+        for r in response.get("results", []):
+            results.append({
+                "href": r.get("url", ""),
+                "title": r.get("title", ""),
+                "body": r.get("content", ""),
+            })
+        return results
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Tavily fallback failed: {e}")
+        return []
 
 def _bedrock_client():
     """Returns an OpenAI-compatible client pointed at the Bedrock Mantle endpoint."""
@@ -23,15 +52,6 @@ def _bedrock_client():
     )
 
 _BEDROCK_MODEL = os.getenv("LLM_MODEL")
-def extract_token_usage(response) -> TokenUsage:
-    if hasattr(response, 'usage') and response.usage:
-        return TokenUsage(
-            input_tokens=response.usage.prompt_tokens or 0,
-            output_tokens=response.usage.completion_tokens or 0,
-            total_tokens=response.usage.total_tokens or 0,
-            call_count=1
-        )
-    return TokenUsage(call_count=1)
 
 # Set up logging
 logging.basicConfig(
@@ -79,7 +99,7 @@ def scrape_page(url: str) -> str:
         return ""
 
 def get_search_context(location: str, target_category: str) -> str:
-    """Uses DuckDuckGo to find real estate portals and scrapes the actual pages for maximum data for a specific category."""
+    """Uses DuckDuckGo (with Tavily fallback) to find real estate portals and scrapes the actual pages for maximum data for a specific category."""
     logger.info(f"Starting expanded DuckDuckGo search + deep scraping for location: {location}, category: {target_category}")
     try:
         if target_category == "residential":
@@ -95,7 +115,22 @@ def get_search_context(location: str, target_category: str) -> str:
         
         context = ""
         for query in queries:
-            results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
+            # --- Primary: DuckDuckGo ---
+            results = []
+            try:
+                results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
+            except Exception as ddg_err:
+                logger.warning(f"DDG failed for query '{query}': {ddg_err}. Falling back to Tavily.")
+
+            # --- Fallback: Tavily ---
+            if not results:
+                logger.info(f"DDG returned no results for '{query}'. Trying Tavily...")
+                results = _tavily_search(query)
+                if results:
+                    logger.info(f"Tavily returned {len(results)} results for '{query}'.")
+                else:
+                    logger.warning(f"Tavily also returned no results for '{query}'.")
+
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
@@ -119,18 +154,7 @@ def get_search_context(location: str, target_category: str) -> str:
         logger.error(f"Search error: {e}")
         return "No search data available."
 
-def parse_llm_json(response_text: str) -> dict:
-    """Helper to safely parse JSON from LLM string output."""
-    try:
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0].strip()
-        data = json.loads(response_text)
-        return data
-    except Exception as e:
-        logger.error(f"JSON Parse Error: {e}\nResponse text was: {response_text}")
-        return {}
+# parse_llm_json and extract_token_usage are imported from utils.py (see top of file)
 
 def build_pipeline_result(location: str, parsed_data: dict) -> PipelineResult:
     loc_id_data = parsed_data.get("location_identification", {})
@@ -171,6 +195,7 @@ def populate_project_urls(pipeline_result: PipelineResult, total_token_usage: To
             return None
         try:
             import time
+            from listing_extractor import fetch_project_urls  # lazy import — avoids circular import at module level
             time.sleep(random.uniform(0.5, 2.5)) # Jitter to prevent 429 Too Many Requests from DDGS
             urls, usage = fetch_project_urls(p.project_name, pipeline_result.location, category, max_urls=15)
             p.portal_listings = [PortalListing(**item) for item in urls if isinstance(item, dict)]
@@ -370,7 +395,7 @@ def run_bedrock_analysis(latitude: str, longitude: str, location: str) -> Tuple[
     return result, total_token_usage
 
 def get_trend_search_context(location: str) -> str:
-    """Uses DuckDuckGo to search for price trends over the last 3 years."""
+    """Uses DuckDuckGo (with Tavily fallback) to search for price trends over the last 3 years."""
     logger.info(f"Starting DuckDuckGo search for trend analysis: {location}")
     try:
         categories = ["flat", "shop", "office", "land"]
@@ -382,15 +407,25 @@ def get_trend_search_context(location: str) -> str:
         import time
         for query in queries:
             results = []
+            # --- Primary: DuckDuckGo with retries ---
             for attempt in range(3):
                 try:
                     results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
                     if results:
                         break
                 except Exception as e:
-                    logger.warning(f"DDGS attempt {attempt+1} failed for trend query: {e}")
+                    logger.warning(f"DDGS attempt {attempt+1} failed for trend query '{query}': {e}")
                     time.sleep(1 + attempt)
-                    
+
+            # --- Fallback: Tavily ---
+            if not results:
+                logger.info(f"DDG returned no results for trend query '{query}'. Trying Tavily...")
+                results = _tavily_search(query)
+                if results:
+                    logger.info(f"Tavily returned {len(results)} results for trend query '{query}'.")
+                else:
+                    logger.warning(f"Tavily also returned no results for trend query '{query}'.")
+
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
@@ -456,7 +491,7 @@ def run_bedrock_trend_analysis(latitude: str, longitude: str, location: str) -> 
         return f"Error fetching trend analysis from Bedrock: {e}", TokenUsage()
 
 def get_appreciation_search_context(location: str) -> str:
-    """Uses DuckDuckGo to search for infrastructure, employment hubs, and appreciation drivers."""
+    """Uses DuckDuckGo (with Tavily fallback) to search for infrastructure, employment hubs, and appreciation drivers."""
     logger.info(f"Starting DuckDuckGo search for appreciation analysis: {location}")
     try:
         queries = [
@@ -466,7 +501,22 @@ def get_appreciation_search_context(location: str) -> str:
         ]
         context = ""
         for query in queries:
-            results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
+            # --- Primary: DuckDuckGo ---
+            results = []
+            try:
+                results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
+            except Exception as ddg_err:
+                logger.warning(f"DDG failed for appreciation query '{query}': {ddg_err}. Falling back to Tavily.")
+
+            # --- Fallback: Tavily ---
+            if not results:
+                logger.info(f"DDG returned no results for appreciation query '{query}'. Trying Tavily...")
+                results = _tavily_search(query)
+                if results:
+                    logger.info(f"Tavily returned {len(results)} results for appreciation query '{query}'.")
+                else:
+                    logger.warning(f"Tavily also returned no results for appreciation query '{query}'.")
+
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
