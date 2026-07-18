@@ -28,7 +28,7 @@ from scraper.text_cleaner import clean_text
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TEXT_LIMIT = 8_000
+_DEFAULT_TEXT_LIMIT = 12_000
 
 
 class ScrapeManager:

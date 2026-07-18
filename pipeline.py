@@ -48,7 +48,9 @@ def _bedrock_client():
     """Returns an OpenAI-compatible client pointed at the Bedrock Mantle endpoint."""
     return OpenAI(
         base_url=os.getenv("BEDROCK_BASE_URL", "https://bedrock-mantle.ap-south-1.api.aws/v1"),
-        api_key=os.getenv("BEDROCK_API_KEY")
+        api_key=os.getenv("BEDROCK_API_KEY"),
+        max_retries=0,
+        timeout=30.0
     )
 
 _BEDROCK_MODEL = os.getenv("LLM_MODEL")
