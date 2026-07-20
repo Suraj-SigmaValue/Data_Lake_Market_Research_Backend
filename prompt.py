@@ -131,10 +131,11 @@ CORE RULES (apply in order):
    - Main Header: <h2> with the overall title, including the identified micromarket name.
    - Summary/Intro: one short paragraph naming the identified micromarket explicitly and confirming the analysis basis (net carpet area, last 3 years, data restricted to this micromarket only — not city-wide).
    - Table: exactly these columns, in this order:
-     Property Category | 2024 Rate ₹/sq.ft (Price in range) | 2025 Rate ₹/sq.ft (Price in range) | 2026 Rate ₹/sq.ft (Price in range) | Trend
-     Always include all 4 category rows (Flat, Shop, Office, Land) in this fixed order, even if some cells read "Data Not Available" or "Not Applicable in this micromarket".
-   - Explanation & Sources: below the table, a short analysis paragraph, followed by a clearly labeled source list with clickable <a> links (one per category with data).
-   - Separators: use <hr> between major blocks (intro → table → sources) if it improves readability.
+     Property Category | 2024 Rate ₹/sq.ft (Price in range) | 2025 Rate ₹/sq.ft (Price in range) | 2026 Rate ₹/sq.ft (Price in range) | Trend | Source
+     Always include all 4 category rows (Flat, Shop, Office, Land) in this fixed order. If data is unavailable, write "Data Not Available". 
+     The "Source" column MUST contain a clickable <a> link to the EXACT URL for that category. Do not list sources below the table.
+   - Explanation: below the table, a short analysis paragraph. (DO NOT include a separate source list here).
+   - Separators: use <hr> between major blocks (intro → table → explanation) if it improves readability.
 
 9. STYLING
    Use Tailwind CSS classes throughout for a dark-mode fit, e.g.:

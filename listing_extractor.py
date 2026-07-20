@@ -105,10 +105,10 @@ def _build_llm_client(provider: str):
 
 
 
-def _validate_extracted_listings(listings: List[dict], requested_category: str, provider: str) -> Tuple[List[dict], TokenUsage]:
+def _validate_extracted_listings(listings: List[dict], requested_project: str, requested_category: str, provider: str) -> Tuple[List[dict], TokenUsage]:
     """
     Pass 2 Semantic Validation Layer.
-    Uses the LLM to semantically verify that each extracted listing matches the requested category.
+    Uses the LLM to semantically verify that each extracted listing matches the requested category and project.
     """
     if not listings:
         from models import TokenUsage
@@ -117,12 +117,14 @@ def _validate_extracted_listings(listings: List[dict], requested_category: str, 
 
     
     validation_prompt = f"""You are a strict Real Estate Semantic Validation AI.
-Your ONLY job is to verify if each extracted property listing truly belongs to the requested category.
+Your ONLY job is to verify if each extracted property listing truly belongs to the requested category and the requested project.
 
+REQUESTED PROJECT: "{requested_project}"
 REQUESTED CATEGORY: "{requested_category}"
 
-You MUST evaluate the semantics of each listing (title, price, area, area_type).
-If the listing is for a different category (e.g., Office when requested is Retail, or Apartment when requested is Land), you MUST reject it.
+You MUST evaluate the semantics of each listing (title, project_name, price, area, area_type).
+1. PROJECT MATCH: If the listing's project name is completely different from "{requested_project}" (e.g. it is a "Similar Property" or "Promoted Project"), you MUST reject it.
+2. CATEGORY MATCH: If the listing is for a different category (e.g., Office when requested is Retail, or Apartment when requested is Land), you MUST reject it.
 CRITICAL RULE: If the REQUESTED CATEGORY is Commercial, Office, or Retail, you MUST strictly reject ANY listing that mentions "BHK", "Bedroom", or "Flat". Commercial spaces are never BHKs.
 If the listing is ambiguous but semantically plausible, you may accept it.
 NEVER modify the listings. Just return a boolean 'is_valid' for each.
@@ -251,24 +253,29 @@ WEBPAGE CONTENT:
 EXTRACTION RULES
 ──────────────────────────────
 1. Extract listings ONLY when ALL of the following match:
-   - Project Name (exact match)
+   - Project Name (exact match or highly similar)
    - Location (same location)
    - Requested Property Category
 
-2. Ignore listings from Recommended, Similar, Nearby, Related, or any clearly different projects.
+2. CRITICAL HALLUCINATION PREVENTION:
+   - Extract the EXACT project name and location as written in the webpage text.
+   - DO NOT blindly copy the requested PROJECT NAME. If the text says "Zen Business Center", the "project_name" field MUST be "Zen Business Center".
+
+3. Ignore listings from Recommended, Similar, Nearby, Related, or any clearly different projects.
    WARNING: Real estate websites aggressively inject "Promoted" or "Similar Properties" from completely different cities at the bottom of the page (e.g., showing a Mumbai property on a Dubai page). You MUST verify the city/region of every single listing. If a listing belongs to a different city than the requested location, you MUST ignore it.
-3. Preserve the ORIGINAL price exactly as shown on the webpage.
+4. Preserve the ORIGINAL price exactly as shown on the webpage.
    - Do NOT convert currencies.
    - Keep the original currency symbol or code (₹, $, AED, €, £, SGD, etc.).
    - Extract only the main property price (ignore EMI, loan offers, savings, discounts, rent etc.).
+   - in Price section, Only Price should be come along with the Currency
 
-4. Currency must match the extracted price.
+5. Currency must match the extracted price.
    Examples:
    - "₹ 2.5 Cr" → "₹"
    - "$450,000" → "$"
    - "AED 1.2M" → "AED"
 
-5. Area must contain ONLY the numeric value with its unit exactly as shown.
+6. Area must contain ONLY the numeric value with its unit exactly as shown.
    Examples:
    - "1,277 sqft"
    - "118 sq.m."
@@ -276,7 +283,7 @@ EXTRACTION RULES
    - "150 sq yd"
    Do NOT include labels like Carpet Area or Built-up Area in this field.
 
-6. Area Type should contain ONLY the area label if explicitly mentioned.
+7. Area Type should contain ONLY the area label if explicitly mentioned.
    Examples:
    - "Carpet Area"
    - "Built-up Area"
@@ -284,11 +291,11 @@ EXTRACTION RULES
    - "Saleable Area"
    Otherwise return an empty string.
 
-7. If the requested property category is Office, Commercial, Retail or Shop, then only should come Office, Commercial, Retail or Shop, otherwise reject listing..
+8. If the requested property category is Office, Commercial, Retail or Shop, then only should come Office, Commercial, Retail or Shop, otherwise reject listing..
 
-8. Webpages may have broken layouts or merged text. Pair the correct Price and Area by reading nearby lines before and after the current line.
+9. Webpages may have broken layouts or merged text. Pair the correct Price and Area by reading nearby lines before and after the current line.
 
-9. If you are not reasonably confident that the project, location, and category refer to the requested property, skip the listing.
+10. If you are not reasonably confident that the project, location, and category refer to the requested property, skip the listing.
 
 ──────────────────────────────
 OUTPUT
@@ -334,7 +341,7 @@ If no valid listing is found, return:
         logger.info(f"Pass 1 extracted {len(extracted)} listing(s) from {url}")
         
         # Pass 2: Semantic Validation
-        validated_extracted, pass2_usage = _validate_extracted_listings(extracted, property_type, provider)
+        validated_extracted, pass2_usage = _validate_extracted_listings(extracted, project_name, property_type, provider)
         
         if len(validated_extracted) < len(extracted):
             logger.info(f"Pass 2 kept {len(validated_extracted)}/{len(extracted)} listing(s) from {url}")

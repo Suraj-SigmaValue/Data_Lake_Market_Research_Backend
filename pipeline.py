@@ -585,13 +585,15 @@ def run_bedrock_appreciation_analysis(latitude: str, longitude: str, location: s
 
 def run_openai_final_analysis(location: str, latitude: str, longitude: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> Tuple[str, TokenUsage]:
     logger.info("Starting OpenAI final analysis pipeline")
+    from datetime import date
     formatted_prompt = STAGE4_PROMPT.format(
         location=location,
         latitude=latitude,
         longitude=longitude,
         price_point_data=json.dumps(price_data),
         trend_data=json.dumps(trend_data),
-        appreciation_data=json.dumps(appreciation_data)
+        appreciation_data=json.dumps(appreciation_data),
+        current_year=date.today().year
     )
     
     try:
@@ -614,13 +616,15 @@ def run_openai_final_analysis(location: str, latitude: str, longitude: str, pric
 
 def run_bedrock_final_analysis(location: str, latitude: str, longitude: str, price_data: dict, trend_data: dict, appreciation_data: dict) -> Tuple[str, TokenUsage]:
     logger.info("Starting Bedrock final analysis pipeline")
+    from datetime import date
     formatted_prompt = STAGE4_PROMPT.format(
         location=location,
         latitude=latitude,
         longitude=longitude,
         price_point_data=json.dumps(price_data),
         trend_data=json.dumps(trend_data),
-        appreciation_data=json.dumps(appreciation_data)
+        appreciation_data=json.dumps(appreciation_data),
+        current_year=date.today().year
     )
     
     try:
