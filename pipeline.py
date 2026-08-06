@@ -100,9 +100,36 @@ def scrape_page(url: str) -> str:
         logger.warning(f"Scrape failed for {url}: {e}")
         return ""
 
-def get_search_context(location: str, target_category: str) -> str:
-    """Uses DuckDuckGo (with Tavily fallback) to find real estate portals and scrapes the actual pages for maximum data for a specific category."""
-    logger.info(f"Starting expanded DuckDuckGo search + deep scraping for location: {location}, category: {target_category}")
+from services.google_places_service import reverse_geocode_google, fetch_nearby_projects_google, fetch_nearby_landmarks_google
+
+def get_search_context(location: str, target_category: str, latitude: str = "", longitude: str = "") -> str:
+    """Uses Google Places API for reverse geocoding & 2km/4km nearby projects, plus DuckDuckGo/Tavily for portal deep scraping."""
+    logger.info(f"Starting expanded search for location: {location}, category: {target_category}, coords: ({latitude}, {longitude})")
+    
+    google_context = ""
+    if latitude and longitude:
+        try:
+            lat_f = float(latitude)
+            lng_f = float(longitude)
+
+            # 1. Reverse Geocode via Google Places
+            geo_info = reverse_geocode_google(lat_f, lng_f)
+            if geo_info.get("formatted_address"):
+                google_context += f"VERIFIED GOOGLE REVERSE GEOLOCATION:\n"
+                google_context += f"- Formatted Address: {geo_info.get('formatted_address')}\n"
+                google_context += f"- Micromarket / Sublocality: {geo_info.get('sublocality') or geo_info.get('locality')}\n"
+                google_context += f"- City: {geo_info.get('city')}, State: {geo_info.get('state')}, Country: {geo_info.get('country')}\n\n"
+
+            # 2. Strict 2 km / 4 km Nearby Projects via Google Places
+            nearby_info = fetch_nearby_projects_google(lat_f, lng_f, min_count=5)
+            if nearby_info.get("projects"):
+                google_context += f"VERIFIED REAL ESTATE PROJECTS NEARBY (Radius: {nearby_info['radius_used_km']} km):\n"
+                for p in nearby_info["projects"]:
+                    google_context += f"• Project: {p['project_name']} | Distance: {p['distance_str']} | Vicinity: {p['vicinity']}\n"
+                google_context += "\n"
+        except Exception as g_err:
+            logger.warning(f"Google Places Context extraction failed: {g_err}")
+
     try:
         if target_category == "residential":
             queries = [f"1 BHK 2 BHK 3 BHK flats apartment for sale in {location} price"]
@@ -115,29 +142,24 @@ def get_search_context(location: str, target_category: str) -> str:
         else:
             queries = [f"properties for sale in {location} price"]
         
-        context = ""
+        web_context = ""
         for query in queries:
-            # --- Primary: DuckDuckGo ---
             results = []
             try:
                 results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
             except Exception as ddg_err:
                 logger.warning(f"DDG failed for query '{query}': {ddg_err}. Falling back to Tavily.")
 
-            # --- Fallback: Tavily ---
             if not results:
                 logger.info(f"DDG returned no results for '{query}'. Trying Tavily...")
                 results = _tavily_search(query)
                 if results:
                     logger.info(f"Tavily returned {len(results)} results for '{query}'.")
-                else:
-                    logger.warning(f"Tavily also returned no results for '{query}'.")
 
             for i, r in enumerate(results):
                 url = r.get('href', '')
                 snippet = r.get('body', '')
                 
-                # Deep scrape the top 2 links of each category for massive data volume
                 page_text = ""
                 if i < 2 and url:
                     page_text = scrape_page(url)
@@ -147,14 +169,16 @@ def get_search_context(location: str, target_category: str) -> str:
                     content_block += f"Page Content Extract:\n{page_text}\n"
                 content_block += "\n"
                 
-                if url not in context:
-                    context += content_block
+                if url not in web_context:
+                    web_context += content_block
                     
-        logger.info(f"Successfully retrieved expanded search + scraped context for {location} (length: {len(context)})")
-        return context
+        full_context = google_context + web_context
+        logger.info(f"Successfully retrieved context for {location} (length: {len(full_context)})")
+        return full_context
     except Exception as e:
         logger.error(f"Search error: {e}")
-        return "No search data available."
+        return google_context or "No search data available."
+
 
 # parse_llm_json and extract_token_usage are imported from utils.py (see top of file)
 
@@ -220,7 +244,7 @@ def populate_project_urls(pipeline_result: PipelineResult, total_token_usage: To
 
 def run_openai_analysis_single_category(latitude: str, longitude: str, location: str, category: str) -> Tuple[dict, TokenUsage]:
     logger.info(f"Starting OpenAI analysis for category: {category}")
-    context = get_search_context(location, category)
+    context = get_search_context(location, category, latitude=latitude, longitude=longitude)
     formatted_prompt = STAGE1_PROMPT.format(latitude=latitude, longitude=longitude, location=location, target_category=category)
     
     try:
@@ -327,7 +351,7 @@ def run_openai_analysis(latitude: str, longitude: str, location: str) -> Tuple[P
 
 def run_bedrock_analysis_single_category(latitude: str, longitude: str, location: str, category: str) -> Tuple[dict, TokenUsage]:
     logger.info(f"Starting Bedrock analysis for category: {category}")
-    context = get_search_context(location, category)
+    context = get_search_context(location, category, latitude=latitude, longitude=longitude)
     formatted_prompt = STAGE1_PROMPT.format(latitude=latitude, longitude=longitude, location=location, target_category=category)
     
     try:
@@ -396,20 +420,32 @@ def run_bedrock_analysis(latitude: str, longitude: str, location: str) -> Tuple[
     logger.info("Successfully parsed concurrent Bedrock response and fetched URLs")
     return result, total_token_usage
 
-def get_trend_search_context(location: str) -> str:
-    """Uses DuckDuckGo (with Tavily fallback) to search for price trends over the last 3 years."""
-    logger.info(f"Starting DuckDuckGo search for trend analysis: {location}")
+def get_trend_search_context(location: str, latitude: str = "", longitude: str = "") -> str:
+    """Uses Google Places reverse geocoding + DuckDuckGo/Tavily for 3-year micromarket trend analysis."""
+    logger.info(f"Starting search for trend analysis: {location}, coords: ({latitude}, {longitude})")
+    
+    google_context = ""
+    if latitude and longitude:
+        try:
+            geo_info = reverse_geocode_google(float(latitude), float(longitude))
+            if geo_info.get("formatted_address"):
+                google_context += f"VERIFIED GOOGLE MICROMARKET LOCATION CONTEXT:\n"
+                google_context += f"- Identified Micromarket / Sublocality: {geo_info.get('sublocality') or geo_info.get('locality')}\n"
+                google_context += f"- Full Formatted Address: {geo_info.get('formatted_address')}\n"
+                google_context += f"- City / State: {geo_info.get('city')}, {geo_info.get('state')}\n\n"
+        except Exception as e:
+            logger.warning(f"Google trend geocoding failed: {e}")
+
     try:
         categories = ["flat", "shop", "office", "land"]
         queries = [f"property price trend last 3 years in {location}"]
         for cat in categories:
             queries.append(f"real estate rate trend {location} {cat}")
             
-        context = ""
+        web_context = ""
         import time
         for query in queries:
             results = []
-            # --- Primary: DuckDuckGo with retries ---
             for attempt in range(3):
                 try:
                     results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
@@ -419,14 +455,9 @@ def get_trend_search_context(location: str) -> str:
                     logger.warning(f"DDGS attempt {attempt+1} failed for trend query '{query}': {e}")
                     time.sleep(1 + attempt)
 
-            # --- Fallback: Tavily ---
             if not results:
                 logger.info(f"DDG returned no results for trend query '{query}'. Trying Tavily...")
                 results = _tavily_search(query)
-                if results:
-                    logger.info(f"Tavily returned {len(results)} results for trend query '{query}'.")
-                else:
-                    logger.warning(f"Tavily also returned no results for trend query '{query}'.")
 
             for i, r in enumerate(results):
                 url = r.get('href', '')
@@ -438,16 +469,16 @@ def get_trend_search_context(location: str) -> str:
                 if page_text:
                     content_block += f"Page Content Extract:\n{page_text[:10000]}\n"
                 content_block += "\n"
-                if url not in context:
-                    context += content_block
-        return context
+                if url not in web_context:
+                    web_context += content_block
+        return google_context + web_context
     except Exception as e:
         logger.error(f"Search error for trend: {e}")
-        return "No search data available."
+        return google_context or "No search data available."
 
 def run_openai_trend_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
     logger.info("Starting OpenAI trend analysis pipeline")
-    context = get_trend_search_context(location)
+    context = get_trend_search_context(location, latitude=latitude, longitude=longitude)
     formatted_prompt = STAGE2_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
     
     try:
@@ -470,7 +501,7 @@ def run_openai_trend_analysis(latitude: str, longitude: str, location: str) -> T
 
 def run_bedrock_trend_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
     logger.info("Starting Bedrock trend analysis pipeline")
-    context = get_trend_search_context(location)
+    context = get_trend_search_context(location, latitude=latitude, longitude=longitude)
     formatted_prompt = STAGE2_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
     
     try:
@@ -492,32 +523,44 @@ def run_bedrock_trend_analysis(latitude: str, longitude: str, location: str) -> 
         logger.error(f"Bedrock trend error: {e}")
         return f"Error fetching trend analysis from Bedrock: {e}", TokenUsage()
 
-def get_appreciation_search_context(location: str) -> str:
-    """Uses DuckDuckGo (with Tavily fallback) to search for infrastructure, employment hubs, and appreciation drivers."""
-    logger.info(f"Starting DuckDuckGo search for appreciation analysis: {location}")
+def get_appreciation_search_context(location: str, latitude: str = "", longitude: str = "") -> str:
+    """Uses Google Places Nearby Search for IT Parks, Metro, Highways, Hospitals, Malls + DuckDuckGo/Tavily."""
+    logger.info(f"Starting search for appreciation analysis: {location}, coords: ({latitude}, {longitude})")
+    
+    google_context = ""
+    if latitude and longitude:
+        try:
+            lat_f = float(latitude)
+            lng_f = float(longitude)
+            geo_info = reverse_geocode_google(lat_f, lng_f)
+            if geo_info.get("formatted_address"):
+                google_context += f"VERIFIED GOOGLE GEOLOCATION CONTEXT:\n"
+                google_context += f"- Formatted Address: {geo_info.get('formatted_address')}\n"
+                google_context += f"- Micromarket / Sublocality: {geo_info.get('sublocality') or geo_info.get('locality')}\n\n"
+
+            landmarks_info = fetch_nearby_landmarks_google(lat_f, lng_f)
+            if landmarks_info:
+                google_context += landmarks_info + "\n"
+        except Exception as e:
+            logger.warning(f"Google appreciation landmarks extraction failed: {e}")
+
     try:
         queries = [
             f"upcoming infrastructure projects metro highways in {location}",
             f"employment hubs IT parks job growth in {location}",
             f"real estate demand supply property appreciation potential {location}"
         ]
-        context = ""
+        web_context = ""
         for query in queries:
-            # --- Primary: DuckDuckGo ---
             results = []
             try:
                 results = list(DDGS().text(query, backend="google,duckduckgo,yandex"))
             except Exception as ddg_err:
                 logger.warning(f"DDG failed for appreciation query '{query}': {ddg_err}. Falling back to Tavily.")
 
-            # --- Fallback: Tavily ---
             if not results:
                 logger.info(f"DDG returned no results for appreciation query '{query}'. Trying Tavily...")
                 results = _tavily_search(query)
-                if results:
-                    logger.info(f"Tavily returned {len(results)} results for appreciation query '{query}'.")
-                else:
-                    logger.warning(f"Tavily also returned no results for appreciation query '{query}'.")
 
             for i, r in enumerate(results):
                 url = r.get('href', '')
@@ -529,16 +572,16 @@ def get_appreciation_search_context(location: str) -> str:
                 if page_text:
                     content_block += f"Page Content Extract:\n{page_text[:4000]}\n"
                 content_block += "\n"
-                if url not in context:
-                    context += content_block
-        return context
+                if url not in web_context:
+                    web_context += content_block
+        return google_context + web_context
     except Exception as e:
         logger.error(f"Search error for appreciation: {e}")
-        return "No search data available."
+        return google_context or "No search data available."
 
 def run_openai_appreciation_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
     logger.info("Starting OpenAI appreciation analysis pipeline")
-    context = get_appreciation_search_context(location)
+    context = get_appreciation_search_context(location, latitude=latitude, longitude=longitude)
     formatted_prompt = STAGE3_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
     
     try:
@@ -561,7 +604,7 @@ def run_openai_appreciation_analysis(latitude: str, longitude: str, location: st
 
 def run_bedrock_appreciation_analysis(latitude: str, longitude: str, location: str) -> Tuple[str, TokenUsage]:
     logger.info("Starting Bedrock appreciation analysis pipeline")
-    context = get_appreciation_search_context(location)
+    context = get_appreciation_search_context(location, latitude=latitude, longitude=longitude)
     formatted_prompt = STAGE3_PROMPT.format(latitude=latitude, longitude=longitude, location=location)
     
     try:

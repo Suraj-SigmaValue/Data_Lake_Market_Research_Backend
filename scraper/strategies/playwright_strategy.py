@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config from environment
 # ---------------------------------------------------------------------------
-_HEADLESS: bool = os.getenv("PLAYWRIGHT_HEADLESS", "false").strip().lower() not in ("false", "0", "no")
+_HEADLESS: bool = os.getenv("PLAYWRIGHT_HEADLESS", "true").strip().lower() not in ("false", "0", "no")
 _PAGE_TIMEOUT_MS: int = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "30000"))
 _MAX_SCROLL_ROUNDS: int = 5
 
